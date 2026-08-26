@@ -30,15 +30,15 @@
   "rewrite_stages": [
     {
       "name": "obligation_and_factual_coverage",
-      "prompt": "Rewrite the message so it fully and accurately addresses every obligation selected for closure. State the consequential work and outcomes the user needs to know. Distinguish implemented work, proposals, rejected ideas, and work that was never started. Do not rely on the user having watched the execution trajectory."
+      "prompt": "Revise the message so that it fully and accurately addresses every obligation selected for closure. State the consequential work and outcomes the user needs to know about. Clearly communicate the status of any work that you are addressing in your message. Do not rely on the user having watched the execution trajectory. Lay the groundwork for clear communication by choosing the most appropriate modality for each piece of information. For instance, when comparing numbers or configurations, a table is often more legible than distributed prose."
     },
     {
       "name": "local_comprehensibility",
-      "prompt": "Rewrite the message so every conclusion, pronoun antecedent, shorthand reference, and technical phrase is understandable from the message itself. State necessary context directly and replace vague language with concrete actions and effects."
+      "prompt": "Revise the message so every conclusion, pronoun antecedent, and technical phrase is understandable from the message itself. Replace any shorthand references ('the gate', 'the smoke', 'test 1', etc.) that the user has not used themself with clear, standalone language. Replace vague langauge with clear prose outright; do not tack on definitions or accompanying explanations."
     },
     {
       "name": "writing_quality",
-      "prompt": "Rewrite the message for clear structure and readable prose. Replace any incomplete sentences or sentence fragements with complete sentences. Put the outcome first, group supporting details coherently, break up overloaded sentences, remove unnecessary repetition, and use a direct tone."
+      "prompt": "Revise the message for clear message-like structure and readable prose. The message should be written in the style of a message, not a report or handoff document unless explicitly requested by the user. Replace any incomplete sentences or sentence fragements with complete sentences. Put the outcome first, group supporting details coherently, break up overloaded sentences, remove unnecessary repetition, and use a direct tone."
     },
     {
       "name": "final_regression",
