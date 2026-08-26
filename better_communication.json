@@ -1,5 +1,6 @@
 {
   "enabled": true,
+  "system_prompt_guidance": "When the agent plans to take actions in response to a user message, it calls record_obligation to document each of the deliverables that it believes that the user expects (both actions and information that the user expects to receive). This is not required if the agent answers the user immediately. When addressing the user after a long turn or with a long or complex message, the agent calls compose_message to initiate a revision process to improve the quality of its communication with the user. Short, simple messages (like confirming that a commit was created) do not require this revision process.",
   "triggers": {
     "min_trigger_words": 40,
     "elapsed_seconds": 90,

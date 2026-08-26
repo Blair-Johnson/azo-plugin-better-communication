@@ -13,7 +13,8 @@ Messages shorter than `min_trigger_words` bypass the rewrite protocol entirely; 
 ## Rewrite protocol
 
 The entire pipeline is available voluntarily. The agent can place a complete proposed response in any editable buffer and call `compose_message(buffer=...)`; the tool adopts that buffer as the active draft and displays the temporal attention gap, current obligation list, proposed message, and first rewrite prompt. If the agent instead attempts to finish without composing, heuristic interception can create and compose a draft automatically.
-A short model-channel system-prompt addendum recommends voluntary composition for long turns or nontrivial work and recommends skipping it for simple confirmations with little to report. The plugin does not append this guidance to user messages.
+
+The configurable model-channel system-prompt addendum tells agents to record obligations proactively during multi-step work, recommends voluntary composition for substantial handoffs, and recommends skipping composition for simple confirmations with little to report. The plugin does not append this guidance to user messages.
 
 After either entry path, the agent edits the active buffer and calls:
 
@@ -36,7 +37,7 @@ Then run `/reload` in the AZO TUI.
 
 ## Configuration
 
-Edit `~/.local/share/agent-zoo/plugin-configs/azo-plugin-better-communication/better_communication.json`, then run `/reload`. `min_trigger_words` is evaluated before every other heuristic: a positive value bypasses messages with fewer words, while `0` or `null` disables the bypass. Remaining trigger thresholds are OR conditions; set any threshold to `null` to disable it. `draft_words_with_work` and `draft_chars_with_work` never trigger on an immediate no-tool reply. `memory_model` controls elapsed-time recall guidance, and `rewrite_stages` controls the ordered stage names and prompts.
+Edit the repository `better_communication.json`, reinstall with `azo-plugin install . --force --force-config`, then run `/reload`. `system_prompt_guidance` controls the complete system-prompt addendum. `min_trigger_words` is evaluated before every other heuristic: a positive value bypasses messages with fewer words, while `0` or `null` disables the bypass. Remaining trigger thresholds are OR conditions; set any threshold to `null` to disable it. `draft_words_with_work` and `draft_chars_with_work` never trigger on an immediate no-tool reply. `memory_model` controls elapsed-time recall guidance, and `rewrite_stages` controls the ordered stage names and prompts.
 
 ## Prototype boundary
 

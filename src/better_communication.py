@@ -48,16 +48,6 @@ _COMMUNICATION_TOOL_NAMES = frozenset({
     LIST_OBLIGATIONS_TOOL,
     CLOSE_OBLIGATION_TOOL,
 })
-_PROTOCOL_GUIDANCE = """
-Use compose_message(buffer=...) voluntarily when preparing a substantial handoff
-after a long turn or nontrivial work. Skip it for short, simple confirmations
-with little to report beyond the result, such as saying that a commit was
-created; heuristic interception remains the fallback. To compose voluntarily,
-put the complete proposed response in an editable buffer, call compose_message,
-and follow the returned rewrite stages until message_user is unlocked.
-""".strip()
-
-
 class RewriteStage:
     __slots__ = ("name", "prompt")
 
@@ -210,17 +200,26 @@ class MemoryRule:
 
 
 class PluginConfig:
-    __slots__ = ("enabled", "triggers", "memory_model", "rewrite_stages", "rewrite_hash")
+    __slots__ = (
+        "enabled",
+        "system_prompt_guidance",
+        "triggers",
+        "memory_model",
+        "rewrite_stages",
+        "rewrite_hash",
+    )
 
     def __init__(
         self,
         enabled: bool,
+        system_prompt_guidance: str,
         triggers: TriggerConfig,
         memory_model,
         rewrite_stages,
         rewrite_hash: str,
     ):
         self.enabled = enabled
+        self.system_prompt_guidance = system_prompt_guidance
         self.triggers = triggers
         self.memory_model = tuple(memory_model)
         self.rewrite_stages = tuple(rewrite_stages)
@@ -264,6 +263,9 @@ def _load_config() -> PluginConfig:
     if not isinstance(raw, dict):
         raise ValueError(f"{path}: top-level configuration must be an object")
 
+    system_prompt_guidance = str(raw.get("system_prompt_guidance") or "").strip()
+    if not system_prompt_guidance:
+        raise ValueError(f"{path}: system_prompt_guidance must be a non-empty string")
     trigger_raw = raw.get("triggers") or {}
     if not isinstance(trigger_raw, dict):
         raise ValueError(f"{path}: triggers must be an object")
@@ -350,6 +352,7 @@ def _load_config() -> PluginConfig:
     ).hexdigest()
     return PluginConfig(
         enabled=bool(raw.get("enabled", True)),
+        system_prompt_guidance=system_prompt_guidance,
         triggers=triggers,
         memory_model=tuple(memory_model),
         rewrite_stages=tuple(stages),
@@ -1175,10 +1178,13 @@ class MessageUser(Tool):
 
 
 class CommunicationProtocolSystemPrompt(RenderTransformRegistrar):
-    """Register concise composition guidance on the model-channel system prompt."""
+    """Register configurable communication guidance on the model-channel system prompt."""
 
     reads = {"entries"}
     transform_name = "human attention composition system prompt"
+
+    def __init__(self, config: PluginConfig):
+        self.guidance = config.system_prompt_guidance
 
     def __call__(self, state):
         if not state.entries:
@@ -1189,7 +1195,7 @@ class CommunicationProtocolSystemPrompt(RenderTransformRegistrar):
             pending=True,
         ):
             return state
-        block = "# Message Composition\n" + _PROTOCOL_GUIDANCE
+        block = "# Message Composition\n" + self.guidance
 
         def transform(messages, _state, _block=block):
             if not messages:
@@ -1243,7 +1249,7 @@ def register_features(builder, *, session, config):
             ComposeMessage(plugin_config),
             RewriteResponse(plugin_config),
             MessageUser(plugin_config),
-            CommunicationProtocolSystemPrompt(),
+            CommunicationProtocolSystemPrompt(plugin_config),
         ],
         order=[
             AppendInput,
