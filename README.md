@@ -2,7 +2,7 @@
 
 An experimental Agent Zoo userspace plugin that treats human attention as a guarded resource. It adds an ordered obligation list and a staged rewrite protocol for substantial end-of-turn summaries.
 
-Short immediate replies pass through normally. Draft length triggers only when the turn already contains work-related tool calls, intervening assistant messages, or recorded file modifications. Elapsed time, multiple assistant messages, and tool-call count remain independently configurable triggers.
+Messages shorter than `min_trigger_words` bypass the rewrite protocol entirely; the default is 40 words. Set it to `0` or `null` to disable this length bypass. For messages at or above the minimum, draft length triggers only when the turn already contains work-related tool calls, intervening assistant messages, or recorded file modifications. Elapsed time, multiple assistant messages, and tool-call count remain independently configurable triggers.
 
 ## Obligations
 
@@ -33,7 +33,7 @@ Then run `/reload` in the AZO TUI.
 
 ## Configuration
 
-Edit `~/.local/share/agent-zoo/plugin-configs/azo-plugin-better-communication/better_communication.json`, then run `/reload`. Trigger thresholds are OR conditions; set any threshold to `null` to disable it. `draft_words_with_work` and `draft_chars_with_work` never trigger on an immediate no-tool reply. `memory_model` controls elapsed-time recall guidance, and `rewrite_stages` controls the ordered stage names and prompts.
+Edit `~/.local/share/agent-zoo/plugin-configs/azo-plugin-better-communication/better_communication.json`, then run `/reload`. `min_trigger_words` is evaluated before every other heuristic: a positive value bypasses messages with fewer words, while `0` or `null` disables the bypass. Remaining trigger thresholds are OR conditions; set any threshold to `null` to disable it. `draft_words_with_work` and `draft_chars_with_work` never trigger on an immediate no-tool reply. `memory_model` controls elapsed-time recall guidance, and `rewrite_stages` controls the ordered stage names and prompts.
 
 ## Prototype boundary
 

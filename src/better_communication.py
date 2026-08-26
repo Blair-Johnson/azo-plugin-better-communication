@@ -182,6 +182,7 @@ class ObligationList:
 
 class TriggerConfig:
     __slots__ = (
+        "min_trigger_words",
         "elapsed_seconds",
         "assistant_messages",
         "tool_calls",
@@ -191,12 +192,14 @@ class TriggerConfig:
 
     def __init__(
         self,
+        min_trigger_words,
         elapsed_seconds,
         assistant_messages,
         tool_calls,
         draft_words_with_work,
         draft_chars_with_work,
     ):
+        self.min_trigger_words = min_trigger_words
         self.elapsed_seconds = elapsed_seconds
         self.assistant_messages = assistant_messages
         self.tool_calls = tool_calls
@@ -271,6 +274,9 @@ def _load_config() -> PluginConfig:
     if not isinstance(trigger_raw, dict):
         raise ValueError(f"{path}: triggers must be an object")
     triggers = TriggerConfig(
+        min_trigger_words=_threshold(
+            trigger_raw.get("min_trigger_words"), "min_trigger_words", integer=True,
+        ),
         elapsed_seconds=_threshold(trigger_raw.get("elapsed_seconds"), "elapsed_seconds"),
         assistant_messages=_threshold(
             trigger_raw.get("assistant_messages"), "assistant_messages", integer=True,
@@ -517,6 +523,9 @@ def _turn_metrics(state, content: str) -> TurnMetrics:
 
 
 def _trigger_reasons(metrics: TurnMetrics, triggers: TriggerConfig) -> tuple[str, ...]:
+    minimum = triggers.min_trigger_words
+    if minimum is not None and minimum > 0 and metrics.draft_words < minimum:
+        return ()
     return tuple(
         reason
         for heuristic in TRIGGER_HEURISTICS

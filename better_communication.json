@@ -1,6 +1,7 @@
 {
   "enabled": true,
   "triggers": {
+    "min_trigger_words": 40,
     "elapsed_seconds": 90,
     "assistant_messages": 3,
     "tool_calls": 4,
