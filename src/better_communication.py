@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 import hashlib
 import json
 import os
@@ -23,6 +24,7 @@ from agent_utils.components import (
     TurnCounter,
 )
 from agent_utils.types import MODEL_RENDER_CHANNEL
+from agents.system_prompt import SystemPromptSkillList
 
 COMPOSE_TOOL = "compose_message"
 REWRITE_TOOL = "rewrite_response"
@@ -47,20 +49,12 @@ _COMMUNICATION_TOOL_NAMES = frozenset({
     CLOSE_OBLIGATION_TOOL,
 })
 _PROTOCOL_GUIDANCE = """
-Human-attention guardrails activate for substantial turns, not ordinary immediate
-replies. Use record_obligation for a user request, correction, decision, or
-expected deliverable that must be communicated back after later work. Use
-list_obligations to inspect the current ordered obligation list. Use
-close_obligation only when an obligation is withdrawn, replaced, duplicated, or
-otherwise resolved without being fulfilled in a published response.
-
-When the guard activates, compose_message(buffer=...) shows an editable scratch
-buffer, the temporal attention gap, open obligations with ages, and the first
-required rewrite prompt. Edit the buffer before calling rewrite_response. The
-first rewrite_response call declares closing_obligations; every rewrite call
-requires a buffer hash different from the previous accepted version and returns
-the next prompt. Only the final accepted rewrite unlocks message_user. Selected
-obligations remain listed until message_user successfully publishes the buffer.
+Use compose_message(buffer=...) voluntarily when preparing a substantial handoff
+after a long turn or nontrivial work. Skip it for short, simple confirmations
+with little to report beyond the result, such as saying that a commit was
+created; heuristic interception remains the fallback. To compose voluntarily,
+put the complete proposed response in an editable buffer, call compose_message,
+and follow the returned rewrite stages until message_user is unlocked.
 """.strip()
 
 
@@ -540,6 +534,24 @@ def _buffer_digest(text: str) -> str:
 def _rewrite_record(state, buffer_id: str) -> dict[str, object] | None:
     return (getattr(state, _REWRITES, {}) or {}).get(buffer_id)
 
+def _begin_rewrite(
+    state,
+    config: PluginConfig,
+    buffer_id: str,
+    text: str,
+    *,
+    origin: str,
+) -> None:
+    setattr(state, _ACTIVE_BUFFER, buffer_id)
+    getattr(state, _REWRITES)[buffer_id] = {
+        "stage_index": 0,
+        "buffer_digest": _buffer_digest(text),
+        "rewrite_hash": config.rewrite_hash,
+        "closing_obligations": None,
+        "origin": origin,
+        "started_at": time.time(),
+    }
+
 
 def _delivery_status(state, config: PluginConfig, buffer_id: str) -> tuple[bool, str]:
     if buffer_id != str(getattr(state, _ACTIVE_BUFFER, "") or ""):
@@ -676,14 +688,13 @@ class MessageCompositionGuard:
             path=f"<message-draft:turn-{getattr(state, 'step', 0)}>",
             turn=getattr(state, "step", 0),
         )
-        setattr(state, _ACTIVE_BUFFER, buffer_id)
-        getattr(state, _REWRITES)[buffer_id] = {
-            "stage_index": 0,
-            "buffer_digest": _buffer_digest(content),
-            "rewrite_hash": self.config.rewrite_hash,
-            "closing_obligations": None,
-            "started_at": time.time(),
-        }
+        _begin_rewrite(
+            state,
+            self.config,
+            buffer_id,
+            content,
+            origin="intercepted",
+        )
         raw_call = {
             "id": f"call_compose_{uuid.uuid4().hex[:20]}",
             "type": "function",
@@ -786,7 +797,6 @@ def _attention_preview(state, buffer_id: str, config: PluginConfig) -> str:
         immediate_reply = _first_reply_after(entries, user_index, current_index)
 
     reasons = _trigger_reasons(metrics, config.triggers)
-    reason_text = "; ".join(reasons) if reasons else "composition was requested explicitly"
     duration = _format_duration(metrics.elapsed_seconds)
     memory_guidance = _memory_guidance(metrics, config)
     checks = "\n".join(
@@ -799,6 +809,10 @@ def _attention_preview(state, buffer_id: str, config: PluginConfig) -> str:
     rewrite = _rewrite_record(state, buffer_id)
     if not rewrite:
         raise ValueError("No rewrite sequence exists for the active draft")
+    if rewrite.get("origin") == "voluntary":
+        reason_text = "composition was requested explicitly by the agent"
+    else:
+        reason_text = "; ".join(reasons) if reasons else "heuristic interception"
     stage_index = int(rewrite.get("stage_index", 0))
     draft_changed_after_completion = (
         stage_index >= len(config.rewrite_stages)
@@ -957,28 +971,46 @@ class ComposeMessage(Tool):
         _OBLIGATIONS,
         _REWRITES,
     }
+    writes = {_ACTIVE_BUFFER, _REWRITES}
     optional_reads = {_TURN_STARTED_AT}
 
     @staticmethod
     def fn(buffer: str) -> str:
-        """Preview a proposed final message buffer.
+        """Start or preview composition for an editable message buffer.
 
         Args:
-            buffer: Active editable scratch buffer containing the proposed message.
+            buffer: Editable buffer containing the complete proposed message.
         """
 
     def __init__(self, config: PluginConfig):
         self.config = config
 
     def available(self, state) -> bool:
-        return self.config.enabled and bool(getattr(state, _ACTIVE_BUFFER, ""))
+        return self.config.enabled
 
     def transform(self, state):
         for tc, kwargs in self.pending(state):
             try:
                 buffer_id = str(kwargs.get("buffer") or "")
-                if buffer_id != str(getattr(state, _ACTIVE_BUFFER, "") or ""):
-                    raise ValueError("compose_message requires the active message draft buffer")
+                if not buffer_id:
+                    raise ValueError("compose_message requires a buffer")
+                active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
+                if active and buffer_id != active:
+                    raise ValueError(
+                        f"compose_message already has active draft {active}; "
+                        "finish or abandon it before composing another buffer"
+                    )
+                buffer = state.buffer_manager.resolve_for_read(state, buffer_id)
+                if getattr(buffer, "readonly", False):
+                    raise ValueError("compose_message requires an editable buffer")
+                if not active or not _rewrite_record(state, buffer_id):
+                    _begin_rewrite(
+                        state,
+                        self.config,
+                        buffer_id,
+                        buffer.text,
+                        origin="voluntary",
+                    )
                 tc.result = _attention_preview(state, buffer_id, self.config)
             except Exception as exc:
                 tc.result = f"ERROR: {type(exc).__name__}: {exc}"
@@ -1142,39 +1174,59 @@ class MessageUser(Tool):
         return state
 
 
-class CommunicationProtocolPrompt(RenderTransformRegistrar):
-    """Attach the composition protocol to the latest user turn for model rendering."""
+class CommunicationProtocolSystemPrompt(RenderTransformRegistrar):
+    """Register concise composition guidance on the model-channel system prompt."""
 
     reads = {"entries"}
-    writes = {"entries"}
+    transform_name = "human attention composition system prompt"
 
     def __call__(self, state):
-        entries = list(getattr(state, "entries", ()) or ())
-        user_index = _latest_user_index(entries)
-        if user_index is None:
+        if not state.entries:
             return state
-        entries[user_index].register_render_transform(
+        entry = state.entries[0]
+        if self.transform_name in entry.render_transform_names(
             MODEL_RENDER_CHANNEL,
-            self._transform,
-            name="human attention composition protocol",
+            pending=True,
+        ):
+            return state
+        block = "# Message Composition\n" + _PROTOCOL_GUIDANCE
+
+        def transform(messages, _state, _block=block):
+            if not messages:
+                return messages
+            first = dict(messages[0])
+            first["content"] = CommunicationProtocolSystemPrompt._append_content(
+                first.get("content"),
+                _block,
+            )
+            return [first, *messages[1:]]
+
+        entry.append_render_transform(
+            MODEL_RENDER_CHANNEL,
+            transform,
+            name=self.transform_name,
         )
         return state
 
     @staticmethod
-    def _transform(messages, _state):
-        block = f"\n\n=== [developer] ===\n{_PROTOCOL_GUIDANCE}"
-        rendered = []
-        appended = False
-        for message in messages:
-            if not appended and isinstance(message, dict) and message.get("role") == "user":
-                rendered.append({
-                    **message,
-                    "content": str(message.get("content") or "") + block,
-                })
-                appended = True
-            else:
-                rendered.append(message)
-        return rendered
+    def _append_content(content: Any, block: str) -> Any:
+        if isinstance(content, str):
+            return content.rstrip() + "\n\n" + block
+        if content is None:
+            return block
+        if isinstance(content, list):
+            rendered = list(content)
+            uses_input_blocks = any(
+                isinstance(item, Mapping)
+                and str(item.get("type") or "").startswith("input_")
+                for item in rendered
+            )
+            rendered.append({
+                "type": "input_text" if uses_input_blocks else "text",
+                "text": block,
+            })
+            return rendered
+        return str(content).rstrip() + "\n\n" + block
 
 
 def register_features(builder, *, session, config):
@@ -1191,7 +1243,7 @@ def register_features(builder, *, session, config):
             ComposeMessage(plugin_config),
             RewriteResponse(plugin_config),
             MessageUser(plugin_config),
-            CommunicationProtocolPrompt(),
+            CommunicationProtocolSystemPrompt(),
         ],
         order=[
             AppendInput,
@@ -1201,7 +1253,8 @@ def register_features(builder, *, session, config):
             Tool,
             ConsolidateToolResults,
             CompressToolResults,
-            CommunicationProtocolPrompt,
+            SystemPromptSkillList,
+            CommunicationProtocolSystemPrompt,
             ExcludeForgotten,
             MessageRenderer,
         ],

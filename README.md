@@ -12,7 +12,10 @@ Messages shorter than `min_trigger_words` bypass the rewrite protocol entirely; 
 
 ## Rewrite protocol
 
-When interception occurs, `compose_message(buffer=...)` displays the temporal attention gap, current obligation list, proposed message, and first rewrite prompt. The agent edits the scratch buffer and calls:
+The entire pipeline is available voluntarily. The agent can place a complete proposed response in any editable buffer and call `compose_message(buffer=...)`; the tool adopts that buffer as the active draft and displays the temporal attention gap, current obligation list, proposed message, and first rewrite prompt. If the agent instead attempts to finish without composing, heuristic interception can create and compose a draft automatically.
+A short model-channel system-prompt addendum recommends voluntary composition for long turns or nontrivial work and recommends skipping it for simple confirmations with little to report. The plugin does not append this guidance to user messages.
+
+After either entry path, the agent edits the active buffer and calls:
 
 ```python
 rewrite_response(
