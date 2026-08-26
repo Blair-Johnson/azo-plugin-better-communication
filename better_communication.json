@@ -32,11 +32,11 @@
     },
     {
       "name": "local_comprehensibility",
-      "prompt": "Rewrite the message so every conclusion, antecedent, shorthand reference, and technical phrase is understandable from the message itself. State necessary context directly and replace vague language with concrete actions and effects."
+      "prompt": "Rewrite the message so every conclusion, pronoun antecedent, shorthand reference, and technical phrase is understandable from the message itself. State necessary context directly and replace vague language with concrete actions and effects."
     },
     {
       "name": "writing_quality",
-      "prompt": "Rewrite the message for clear structure and readable prose. Put the outcome first, group supporting details coherently, repair fragments and overloaded sentences, remove unnecessary repetition, and use a direct calibrated tone."
+      "prompt": "Rewrite the message for clear structure and readable prose. Replace any incomplete sentences or sentence fragements with complete sentences. Put the outcome first, group supporting details coherently, break up overloaded sentences, remove unnecessary repetition, and use a direct tone."
     },
     {
       "name": "final_regression",
