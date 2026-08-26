@@ -1,0 +1,46 @@
+{
+  "enabled": true,
+  "triggers": {
+    "elapsed_seconds": 90,
+    "assistant_messages": 3,
+    "tool_calls": 4,
+    "draft_words_with_work": 180,
+    "draft_chars_with_work": 1200
+  },
+  "memory_model": [
+    {
+      "before_elapsed_seconds": 30,
+      "guidance": "Despite likely distraction, the user is likely to remember the specific wording of their question. Do not assume they monitored subsequent agent work."
+    },
+    {
+      "before_elapsed_seconds": 300,
+      "guidance": "The user is likely to remember what they asked for, but may not remember its specific wording. Do not assume they monitored subsequent agent work."
+    },
+    {
+      "before_elapsed_seconds": 600,
+      "guidance": "The user is likely to remember the broad goal, but not the exact wording or recent conversational details. Do not assume they monitored agent work."
+    },
+    {
+      "before_elapsed_seconds": null,
+      "guidance": "Treat this as a long absence. The user may remember broad project context but is unlikely to retain the current task's specific context. Do not assume they monitored agent work."
+    }
+  ],
+  "rewrite_stages": [
+    {
+      "name": "obligation_and_factual_coverage",
+      "prompt": "Rewrite the message so it fully and accurately addresses every obligation selected for closure. State the consequential work and outcomes the user needs to know. Distinguish implemented work, proposals, rejected ideas, and work that was never started. Do not rely on the user having watched the execution trajectory."
+    },
+    {
+      "name": "local_comprehensibility",
+      "prompt": "Rewrite the message so every conclusion, antecedent, shorthand reference, and technical phrase is understandable from the message itself. State necessary context directly and replace vague language with concrete actions and effects."
+    },
+    {
+      "name": "writing_quality",
+      "prompt": "Rewrite the message for clear structure and readable prose. Put the outcome first, group supporting details coherently, repair fragments and overloaded sentences, remove unnecessary repetition, and use a direct calibrated tone."
+    },
+    {
+      "name": "final_regression",
+      "prompt": "Reread the complete message as the human will receive it. Repair any factual, coverage, context, antecedent, vagueness, structure, sentence, concision, or tone problem introduced or missed by earlier rewrites. Preserve necessary information while removing avoidable friction."
+    }
+  ]
+}

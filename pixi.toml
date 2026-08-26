@@ -1,0 +1,11 @@
+[workspace]
+name = "azo-plugin-better-communication"
+channels = ["conda-forge"]
+platforms = ["linux-64", "osx-arm64"]
+
+[tool.agent-zoo.plugin]
+name = "azo-plugin-better-communication"
+default = ["src/better_communication.py"]
+
+[tool.agent-zoo.plugin.config]
+files = ["better_communication.json"]

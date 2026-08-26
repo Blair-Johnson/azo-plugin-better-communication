@@ -1,0 +1,1199 @@
+"""Guard human attention with an explicit draft-preview-submit protocol."""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import re
+import time
+import uuid
+from pathlib import Path
+from typing import Any, Callable
+
+from agent_utils import Feature, Tool, ToolCall, estimate_tokens
+from agent_utils.components import (
+    AppendInput,
+    CompressToolResults,
+    ConsolidateToolResults,
+    ExcludeForgotten,
+    MessageRenderer,
+    RenderTransformRegistrar,
+    ToolDispatchStart,
+    TurnCounter,
+)
+from agent_utils.types import MODEL_RENDER_CHANNEL
+
+COMPOSE_TOOL = "compose_message"
+REWRITE_TOOL = "rewrite_response"
+MESSAGE_USER_TOOL = "message_user"
+RECORD_OBLIGATION_TOOL = "record_obligation"
+LIST_OBLIGATIONS_TOOL = "list_obligations"
+CLOSE_OBLIGATION_TOOL = "close_obligation"
+_TURN_STARTED_AT = "_communication_turn_started_at"
+_ACTIVE_BUFFER = "_communication_active_buffer"
+_OBLIGATIONS = "_communication_obligations"
+_REWRITES = "_communication_rewrites"
+_CONFIG_ENV = "AZO_BETTER_COMMUNICATION_CONFIG"
+_CONFIG_NAME = "better_communication.json"
+_ENTRY_METADATA_KEY = "better_communication"
+_DEFERRED_EAGER_TOOL_NAMES = "_deferred_eager_tool_names"
+_COMMUNICATION_TOOL_NAMES = frozenset({
+    COMPOSE_TOOL,
+    REWRITE_TOOL,
+    MESSAGE_USER_TOOL,
+    RECORD_OBLIGATION_TOOL,
+    LIST_OBLIGATIONS_TOOL,
+    CLOSE_OBLIGATION_TOOL,
+})
+_PROTOCOL_GUIDANCE = """
+Human-attention guardrails activate for substantial turns, not ordinary immediate
+replies. Use record_obligation for a user request, correction, decision, or
+expected deliverable that must be communicated back after later work. Use
+list_obligations to inspect the current ordered obligation list. Use
+close_obligation only when an obligation is withdrawn, replaced, duplicated, or
+otherwise resolved without being fulfilled in a published response.
+
+When the guard activates, compose_message(buffer=...) shows an editable scratch
+buffer, the temporal attention gap, open obligations with ages, and the first
+required rewrite prompt. Edit the buffer before calling rewrite_response. The
+first rewrite_response call declares closing_obligations; every rewrite call
+requires a buffer hash different from the previous accepted version and returns
+the next prompt. Only the final accepted rewrite unlocks message_user. Selected
+obligations remain listed until message_user successfully publishes the buffer.
+""".strip()
+
+
+class RewriteStage:
+    __slots__ = ("name", "prompt")
+
+    def __init__(self, name: str, prompt: str):
+        self.name = name
+        self.prompt = prompt
+
+
+class Obligation:
+    __slots__ = (
+        "obligation_id",
+        "user_language",
+        "predicted_response_expectations",
+        "source_user_message",
+        "source_entry_index",
+        "added_at_time",
+        "added_at_message_count",
+    )
+
+    def __init__(
+        self,
+        obligation_id: str,
+        user_language: str,
+        predicted_response_expectations: str,
+        source_user_message: str,
+        source_entry_index: int,
+        added_at_time: float,
+        added_at_message_count: int,
+    ):
+        self.obligation_id = obligation_id
+        self.user_language = user_language
+        self.predicted_response_expectations = predicted_response_expectations
+        self.source_user_message = source_user_message
+        self.source_entry_index = source_entry_index
+        self.added_at_time = added_at_time
+        self.added_at_message_count = added_at_message_count
+
+    def to_dict(self) -> dict[str, object]:
+        return {slot: getattr(self, slot) for slot in self.__slots__}
+
+    @classmethod
+    def from_dict(cls, data: dict[str, object]) -> "Obligation":
+        return cls(**data)
+
+
+class ObligationList:
+    """Ordered push/remove list of user-facing communication obligations."""
+
+    def __init__(self):
+        self._items: list[Obligation] = []
+
+    def add(
+        self,
+        *,
+        user_language: str,
+        predicted_response_expectations: str,
+        source_user_message: str,
+        source_entry_index: int,
+        message_count: int,
+    ) -> str:
+        obligation_id = f"obl_{uuid.uuid4().hex[:10]}"
+        self._items.append(Obligation(
+            obligation_id=obligation_id,
+            user_language=user_language,
+            predicted_response_expectations=predicted_response_expectations,
+            source_user_message=source_user_message,
+            source_entry_index=source_entry_index,
+            added_at_time=time.time(),
+            added_at_message_count=message_count,
+        ))
+        return obligation_id
+
+    def ids(self) -> tuple[str, ...]:
+        return tuple(item.obligation_id for item in self._items)
+
+    def remove(self, obligation_id: str) -> Obligation | None:
+        for index, item in enumerate(self._items):
+            if item.obligation_id == obligation_id:
+                return self._items.pop(index)
+        return None
+
+    def remove_many(self, obligation_ids: list[str]) -> list[Obligation]:
+        removed = []
+        for obligation_id in obligation_ids:
+            item = self.remove(obligation_id)
+            if item is not None:
+                removed.append(item)
+        return removed
+
+    def render(self, *, current_time: float, current_message_count: int) -> str:
+        if not self._items:
+            return "No obligations are currently recorded."
+        lines = ["Obligations:"]
+        for item in self._items:
+            elapsed = _format_duration(current_time - item.added_at_time)
+            messages = max(0, current_message_count - item.added_at_message_count)
+            lines.extend([
+                f"- {item.obligation_id} (age: {elapsed}; {messages} messages)",
+                f"  User language: {item.user_language}",
+                f"  Predicted response expectations: {item.predicted_response_expectations}",
+            ])
+        return "\n".join(lines)
+
+    def save_state(self) -> list[dict[str, object]]:
+        return [item.to_dict() for item in self._items]
+
+    def restore_state(self, state: list[dict[str, object]]) -> None:
+        self._items = [Obligation.from_dict(item) for item in state]
+
+    def __len__(self) -> int:
+        return len(self._items)
+
+    def __bool__(self) -> bool:
+        return bool(self._items)
+
+
+class TriggerConfig:
+    __slots__ = (
+        "elapsed_seconds",
+        "assistant_messages",
+        "tool_calls",
+        "draft_words_with_work",
+        "draft_chars_with_work",
+    )
+
+    def __init__(
+        self,
+        elapsed_seconds,
+        assistant_messages,
+        tool_calls,
+        draft_words_with_work,
+        draft_chars_with_work,
+    ):
+        self.elapsed_seconds = elapsed_seconds
+        self.assistant_messages = assistant_messages
+        self.tool_calls = tool_calls
+        self.draft_words_with_work = draft_words_with_work
+        self.draft_chars_with_work = draft_chars_with_work
+
+
+class MemoryRule:
+    __slots__ = ("before_elapsed_seconds", "guidance")
+
+    def __init__(self, before_elapsed_seconds, guidance: str):
+        self.before_elapsed_seconds = before_elapsed_seconds
+        self.guidance = guidance
+
+
+class PluginConfig:
+    __slots__ = ("enabled", "triggers", "memory_model", "rewrite_stages", "rewrite_hash")
+
+    def __init__(
+        self,
+        enabled: bool,
+        triggers: TriggerConfig,
+        memory_model,
+        rewrite_stages,
+        rewrite_hash: str,
+    ):
+        self.enabled = enabled
+        self.triggers = triggers
+        self.memory_model = tuple(memory_model)
+        self.rewrite_stages = tuple(rewrite_stages)
+        self.rewrite_hash = rewrite_hash
+
+
+def _config_path() -> Path:
+    override = os.environ.get(_CONFIG_ENV, "").strip()
+    if override:
+        return Path(override).expanduser()
+    install_root = os.environ.get("AGENT_ZOO_INSTALL_ROOT", "").strip()
+    if install_root:
+        data_root = Path(install_root).expanduser()
+    else:
+        xdg_root = Path(
+            os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
+        ).expanduser()
+        data_root = xdg_root / "agent-zoo"
+    installed = data_root / "plugin-configs" / "azo-plugin-better-communication" / _CONFIG_NAME
+    if installed.exists():
+        return installed
+    return Path(__file__).resolve().parent.parent / _CONFIG_NAME
+
+
+def _threshold(value: Any, name: str, *, integer: bool = False):
+    label = name if name.startswith("memory_model") else f"triggers.{name}"
+    if value is None:
+        return None
+    try:
+        parsed = int(value) if integer else float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a non-negative number or null") from exc
+    if parsed < 0:
+        raise ValueError(f"{label} must be non-negative or null")
+    return parsed
+
+
+def _load_config() -> PluginConfig:
+    path = _config_path()
+    raw = json.loads(path.read_text(encoding="utf-8"))
+    if not isinstance(raw, dict):
+        raise ValueError(f"{path}: top-level configuration must be an object")
+
+    trigger_raw = raw.get("triggers") or {}
+    if not isinstance(trigger_raw, dict):
+        raise ValueError(f"{path}: triggers must be an object")
+    triggers = TriggerConfig(
+        elapsed_seconds=_threshold(trigger_raw.get("elapsed_seconds"), "elapsed_seconds"),
+        assistant_messages=_threshold(
+            trigger_raw.get("assistant_messages"), "assistant_messages", integer=True,
+        ),
+        tool_calls=_threshold(trigger_raw.get("tool_calls"), "tool_calls", integer=True),
+        draft_words_with_work=_threshold(
+            trigger_raw.get("draft_words_with_work"),
+            "draft_words_with_work",
+            integer=True,
+        ),
+        draft_chars_with_work=_threshold(
+            trigger_raw.get("draft_chars_with_work"),
+            "draft_chars_with_work",
+            integer=True,
+        ),
+    )
+
+    memory_raw = raw.get("memory_model")
+    if not isinstance(memory_raw, list) or not memory_raw:
+        raise ValueError(f"{path}: memory_model must be a non-empty list")
+    memory_model = []
+    previous_limit = -1.0
+    for index, item in enumerate(memory_raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"{path}: memory_model[{index}] must be an object")
+        guidance = str(item.get("guidance") or "").strip()
+        if not guidance:
+            raise ValueError(f"{path}: memory_model[{index}] requires guidance")
+        raw_limit = item.get("before_elapsed_seconds")
+        if raw_limit is None:
+            if index != len(memory_raw) - 1:
+                raise ValueError(f"{path}: only the final memory_model rule may use null")
+            limit = None
+        else:
+            limit = _threshold(raw_limit, f"memory_model[{index}].before_elapsed_seconds")
+            if limit <= previous_limit:
+                raise ValueError(f"{path}: memory_model time limits must increase")
+            previous_limit = limit
+        memory_model.append(MemoryRule(limit, guidance))
+    if memory_model[-1].before_elapsed_seconds is not None:
+        raise ValueError(f"{path}: memory_model requires a final null fallback rule")
+
+    stages_raw = raw.get("rewrite_stages")
+    if not isinstance(stages_raw, list) or not stages_raw:
+        raise ValueError(f"{path}: rewrite_stages must be a non-empty list")
+    stages = []
+    seen = set()
+    for index, item in enumerate(stages_raw):
+        if not isinstance(item, dict):
+            raise ValueError(f"{path}: rewrite_stages[{index}] must be an object")
+        name = str(item.get("name") or "").strip()
+        prompt = str(item.get("prompt") or "").strip()
+        if not name:
+            raise ValueError(f"{path}: rewrite_stages[{index}] requires name")
+        if name in seen:
+            raise ValueError(f"{path}: duplicate rewrite stage name {name!r}")
+        if not prompt:
+            raise ValueError(f"{path}: rewrite stage {name!r} requires prompt")
+        seen.add(name)
+        stages.append(RewriteStage(name=name, prompt=prompt))
+
+    canonical = {
+        "memory_model": [
+            {
+                "before_elapsed_seconds": rule.before_elapsed_seconds,
+                "guidance": rule.guidance,
+            }
+            for rule in memory_model
+        ],
+        "rewrite_stages": [
+            {"name": stage.name, "prompt": stage.prompt}
+            for stage in stages
+        ],
+    }
+    rewrite_hash = hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    return PluginConfig(
+        enabled=bool(raw.get("enabled", True)),
+        triggers=triggers,
+        memory_model=tuple(memory_model),
+        rewrite_stages=tuple(stages),
+        rewrite_hash=rewrite_hash,
+    )
+
+def _assistant_content(entry: Any) -> str:
+    for message in getattr(entry, "messages", ()) or ():
+        if isinstance(message, dict) and message.get("role") == "assistant":
+            return str(message.get("content") or "")
+    return ""
+
+
+def _latest_user_index(entries: list[Any]) -> int | None:
+    for index in range(len(entries) - 1, -1, -1):
+        entry = entries[index]
+        if (
+            getattr(entry, "role", "") == "user"
+            and not getattr(entry, "system_generated", False)
+        ):
+            return index
+    return None
+
+
+def _ordinary_message_count(state) -> int:
+    return sum(
+        1
+        for entry in (getattr(state, "entries", ()) or ())
+        if getattr(entry, "role", "") in {"user", "assistant"}
+        and not getattr(entry, "system_generated", False)
+    )
+
+
+class TurnMetrics:
+    __slots__ = (
+        "elapsed_seconds",
+        "assistant_messages",
+        "intervening_messages",
+        "tool_calls",
+        "modified_paths",
+        "draft_chars",
+        "draft_words",
+    )
+
+    def __init__(
+        self,
+        elapsed_seconds,
+        assistant_messages,
+        intervening_messages,
+        tool_calls,
+        modified_paths,
+        draft_chars,
+        draft_words,
+    ):
+        self.elapsed_seconds = elapsed_seconds
+        self.assistant_messages = assistant_messages
+        self.intervening_messages = intervening_messages
+        self.tool_calls = tool_calls
+        self.modified_paths = tuple(modified_paths)
+        self.draft_chars = draft_chars
+        self.draft_words = draft_words
+
+
+TriggerHeuristic = Callable[[TurnMetrics, TriggerConfig], str | None]
+
+
+def _long_turn(metrics: TurnMetrics, triggers: TriggerConfig) -> str | None:
+    threshold = triggers.elapsed_seconds
+    if threshold is not None and metrics.elapsed_seconds >= threshold:
+        return f"turn elapsed time is {_format_duration(metrics.elapsed_seconds)}"
+    return None
+
+
+def _many_agent_messages(metrics: TurnMetrics, triggers: TriggerConfig) -> str | None:
+    threshold = triggers.assistant_messages
+    if threshold is not None and metrics.assistant_messages >= threshold:
+        return f"turn contains {metrics.assistant_messages} assistant messages"
+    return None
+
+
+def _many_tool_calls(metrics: TurnMetrics, triggers: TriggerConfig) -> str | None:
+    threshold = triggers.tool_calls
+    if threshold is not None and metrics.tool_calls >= threshold:
+        return f"turn contains {metrics.tool_calls} work-related tool calls"
+    return None
+
+
+def _long_proposed_message_with_work(
+    metrics: TurnMetrics, triggers: TriggerConfig,
+) -> str | None:
+    if not (metrics.tool_calls or metrics.intervening_messages or metrics.modified_paths):
+        return None
+    word_threshold = triggers.draft_words_with_work
+    char_threshold = triggers.draft_chars_with_work
+    if word_threshold is not None and metrics.draft_words >= word_threshold:
+        return f"proposed work summary is {metrics.draft_words} words"
+    if char_threshold is not None and metrics.draft_chars >= char_threshold:
+        return f"proposed work summary is {metrics.draft_chars} characters"
+    return None
+
+
+TRIGGER_HEURISTICS: tuple[TriggerHeuristic, ...] = (
+    _long_turn,
+    _many_agent_messages,
+    _many_tool_calls,
+    _long_proposed_message_with_work,
+)
+
+
+def _format_duration(seconds: float) -> str:
+    seconds = max(0, int(seconds))
+    if seconds < 60:
+        return f"{seconds}s"
+    minutes, remainder = divmod(seconds, 60)
+    if minutes < 60:
+        return f"{minutes}m {remainder}s"
+    hours, minutes = divmod(minutes, 60)
+    return f"{hours}h {minutes}m"
+
+
+def _turn_metrics(state, content: str) -> TurnMetrics:
+    entries = list(getattr(state, "entries", ()) or ())
+    user_index = _latest_user_index(entries)
+    turn_start = user_index + 1 if user_index is not None else 0
+    current_index = max(turn_start, len(entries) - 1)
+    assistant_messages = sum(
+        1 for entry in entries[turn_start:]
+        if getattr(entry, "role", "") == "assistant"
+    )
+
+    first_reply_index = None
+    for index in range(turn_start, current_index):
+        entry = entries[index]
+        if getattr(entry, "role", "") == "assistant" and _assistant_content(entry).strip():
+            first_reply_index = index
+            break
+    gap_start = first_reply_index + 1 if first_reply_index is not None else turn_start
+    intervening_messages = sum(
+        1 for entry in entries[gap_start:current_index]
+        if getattr(entry, "role", "") == "assistant"
+    )
+
+    tool_calls = 0
+    modified_paths = set()
+    for entry in entries[turn_start:current_index]:
+        for call in getattr(entry, "tool_calls", None) or ():
+            if getattr(call, "name", "") in _COMMUNICATION_TOOL_NAMES:
+                continue
+            tool_calls += 1
+            for artifact in getattr(call, "artifacts", None) or ():
+                path = str(getattr(artifact, "path", "") or "").strip()
+                if path and getattr(artifact, "kind", "") == "diff":
+                    modified_paths.add(path)
+
+    started_at = float(getattr(state, _TURN_STARTED_AT, time.time()) or time.time())
+    return TurnMetrics(
+        elapsed_seconds=max(0.0, time.time() - started_at),
+        assistant_messages=assistant_messages,
+        intervening_messages=intervening_messages,
+        tool_calls=tool_calls,
+        modified_paths=sorted(modified_paths),
+        draft_chars=len(content),
+        draft_words=len(content.split()),
+    )
+
+
+def _trigger_reasons(metrics: TurnMetrics, triggers: TriggerConfig) -> tuple[str, ...]:
+    return tuple(
+        reason
+        for heuristic in TRIGGER_HEURISTICS
+        if (reason := heuristic(metrics, triggers))
+    )
+
+
+def _buffer_digest(text: str) -> str:
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+def _rewrite_record(state, buffer_id: str) -> dict[str, object] | None:
+    return (getattr(state, _REWRITES, {}) or {}).get(buffer_id)
+
+
+def _delivery_status(state, config: PluginConfig, buffer_id: str) -> tuple[bool, str]:
+    if buffer_id != str(getattr(state, _ACTIVE_BUFFER, "") or ""):
+        return False, "That buffer is not the active message draft."
+    try:
+        text = state.buffer_manager.resolve_for_read(state, buffer_id).text
+    except (KeyError, ValueError) as exc:
+        return False, str(exc)
+    rewrite = _rewrite_record(state, buffer_id)
+    if not rewrite:
+        return False, "No rewrite sequence exists for this draft."
+    if rewrite.get("rewrite_hash") != config.rewrite_hash:
+        return False, "The configured rewrite stages changed after composition began."
+    stage_index = int(rewrite.get("stage_index", 0))
+    if stage_index < len(config.rewrite_stages):
+        stage = config.rewrite_stages[stage_index]
+        return False, f"Rewrite stage {stage_index + 1} ({stage.name}) is still required."
+    if rewrite.get("buffer_digest") != _buffer_digest(text):
+        return False, "The draft changed after the final rewrite stage was accepted."
+    obligations = getattr(state, _OBLIGATIONS)
+    missing = [
+        obligation_id
+        for obligation_id in rewrite.get("closing_obligations", [])
+        if obligation_id not in obligations.ids()
+    ]
+    if missing:
+        return False, "Selected obligations are no longer present: " + ", ".join(missing)
+    return True, "All rewrite stages are complete and delivery is unlocked."
+
+
+def _entry_is_published(entry: Any) -> bool:
+    metadata = getattr(entry, "metadata", {}) or {}
+    record = metadata.get(_ENTRY_METADATA_KEY, {}) if isinstance(metadata, dict) else {}
+    return bool(isinstance(record, dict) and record.get("published"))
+
+
+class MessageCompositionGuard:
+    """Apply configured triggers, stage drafts, and enforce rewritten delivery."""
+
+    reads = {"entries", "pending_tool_calls", "buffer_manager", "step"}
+    writes = {
+        "entries",
+        "pending_tool_calls",
+        "buffer_manager",
+        _ACTIVE_BUFFER,
+        _OBLIGATIONS,
+        _REWRITES,
+        _DEFERRED_EAGER_TOOL_NAMES,
+    }
+    optional_reads = {_TURN_STARTED_AT}
+    init = {
+        _ACTIVE_BUFFER: str,
+        _OBLIGATIONS: ObligationList,
+        _REWRITES: dict,
+        _DEFERRED_EAGER_TOOL_NAMES: set,
+    }
+
+    def __init__(self, config: PluginConfig):
+        self.config = config
+
+    def __call__(self, state):
+        deferred_names = getattr(state, _DEFERRED_EAGER_TOOL_NAMES)
+        deferred_names.add(MESSAGE_USER_TOOL)
+        if not state.entries:
+            return state
+        entry = state.entries[-1]
+        role = getattr(entry, "role", "")
+        if role == "user" and not getattr(entry, "system_generated", False):
+            setattr(state, _TURN_STARTED_AT, time.time())
+            active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
+            if active:
+                getattr(state, _REWRITES).pop(active, None)
+            setattr(state, _ACTIVE_BUFFER, "")
+            return state
+        if role != "assistant" or not self.config.enabled:
+            return state
+
+        if getattr(entry, "step", None) != getattr(state, "step", None):
+            return state
+        if _entry_is_published(entry):
+            setattr(state, _ACTIVE_BUFFER, "")
+            return state
+        calls = list(getattr(entry, "tool_calls", None) or [])
+        if calls:
+            self._commit_message_user(state, entry, calls)
+            return state
+
+        content = _assistant_content(entry)
+        metrics = _turn_metrics(state, content)
+        reasons = _trigger_reasons(metrics, self.config.triggers)
+        if reasons:
+            self._stage_text_draft(state, entry, content)
+        return state
+
+    def _commit_message_user(self, state, entry, calls: list[ToolCall]) -> None:
+        if len(calls) != 1 or calls[0].name != MESSAGE_USER_TOOL:
+            return
+        buffer_id = calls[0].parsed_args.get("buffer")
+        if not isinstance(buffer_id, str) or not buffer_id:
+            return
+        current, _ = _delivery_status(state, self.config, buffer_id)
+        if not current:
+            return
+        content = state.buffer_manager.resolve_for_read(state, buffer_id).text
+        if not content.strip():
+            return
+
+        rewrite = _rewrite_record(state, buffer_id) or {}
+        closing_obligations = list(rewrite.get("closing_obligations", []))
+        original = dict(entry.messages[0])
+        original.pop("tool_calls", None)
+        original["content"] = content
+        entry.messages = [original]
+        entry.tool_calls = None
+        entry.tokens = estimate_tokens(content)
+        metadata = dict(getattr(entry, "metadata", {}) or {})
+        metadata[_ENTRY_METADATA_KEY] = {
+            "published": True,
+            "published_at": time.time(),
+            "buffer_digest": _buffer_digest(content),
+            "rewrite_hash": self.config.rewrite_hash,
+            "rewrite_stages": [stage.name for stage in self.config.rewrite_stages],
+            "closed_obligations": closing_obligations,
+        }
+        entry.metadata = metadata
+        getattr(state, _OBLIGATIONS).remove_many(closing_obligations)
+        getattr(state, _REWRITES).pop(buffer_id, None)
+        state.pending_tool_calls = []
+        setattr(state, _ACTIVE_BUFFER, "")
+
+    def _stage_text_draft(self, state, entry, content: str) -> None:
+        buffer_id, _ = state.buffer_manager.create_scratch_buffer(
+            content,
+            path=f"<message-draft:turn-{getattr(state, 'step', 0)}>",
+            turn=getattr(state, "step", 0),
+        )
+        setattr(state, _ACTIVE_BUFFER, buffer_id)
+        getattr(state, _REWRITES)[buffer_id] = {
+            "stage_index": 0,
+            "buffer_digest": _buffer_digest(content),
+            "rewrite_hash": self.config.rewrite_hash,
+            "closing_obligations": None,
+            "started_at": time.time(),
+        }
+        raw_call = {
+            "id": f"call_compose_{uuid.uuid4().hex[:20]}",
+            "type": "function",
+            "function": {
+                "name": COMPOSE_TOOL,
+                "arguments": json.dumps({"buffer": buffer_id}),
+            },
+        }
+        message = entry.messages[0]
+        message["content"] = ""
+        message["tool_calls"] = [raw_call]
+        call = ToolCall.from_raw(raw_call)
+        entry.tool_calls = [call]
+        entry.tokens = estimate_tokens(call.raw_args)
+        state.pending_tool_calls = [call]
+
+
+def _first_reply_after(entries: list[Any], user_index: int, current_index: int) -> str:
+    for entry in entries[user_index + 1:current_index]:
+        if getattr(entry, "role", "") != "assistant":
+            continue
+        text = _assistant_content(entry).strip()
+        if text:
+            return text
+    return "(The agent began working without a substantive textual reply.)"
+
+
+def _memory_guidance(metrics: TurnMetrics, config: PluginConfig) -> str:
+    for rule in config.memory_model:
+        if (
+            rule.before_elapsed_seconds is None
+            or metrics.elapsed_seconds < rule.before_elapsed_seconds
+        ):
+            return rule.guidance
+    return config.memory_model[-1].guidance
+
+
+def _modified_paths_text(paths: tuple[str, ...]) -> str:
+    if not paths:
+        return "none recorded"
+    shown = list(paths[:6])
+    suffix = f"; +{len(paths) - len(shown)} more" if len(paths) > len(shown) else ""
+    return ", ".join(shown) + suffix
+
+
+def _communication_checks(content: str, metrics: TurnMetrics, config: PluginConfig) -> list[str]:
+    checks = [
+        f"Configured memory model: {_memory_guidance(metrics, config)}",
+        "Do not treat the exact earlier user message or immediate reply as text the human can reread while receiving the proposed message.",
+        "Make every conclusion, antecedent, and next step understandable from the proposed message itself. Treat the memory model as a risk estimate, not permission to rely on recall.",
+        "State the outcome before supporting implementation details when the outcome is known.",
+    ]
+    if metrics.intervening_messages:
+        checks.append(
+            f"The attention gap contained {metrics.intervening_messages} intervening assistant messages; do not assume the human followed or retained them."
+        )
+    if metrics.tool_calls:
+        checks.append(
+            f"The agent made {metrics.tool_calls} work-related tool calls during the gap; summarize the consequential work rather than referring to 'the changes' or 'the experiment'."
+        )
+    if metrics.modified_paths:
+        checks.append(
+            f"Recorded write artifacts show {len(metrics.modified_paths)} external files changed; name the important files or systems when that matters to the outcome."
+        )
+    if _trigger_reasons(metrics, config.triggers) and metrics.draft_words < 80:
+        checks.append(
+            "The turn was substantial but the draft is short; verify that it explains the goal, work performed, result, and remaining limitation."
+        )
+    table_lines = re.findall(r"(?m)^\s*\|.+\|\s*$", content)
+    if len(table_lines) >= 2 or "<table" in content.lower():
+        checks.append(
+            "The message contains a table. State its principal takeaway in prose so the human does not need to reconstruct the conclusion from cells."
+        )
+    if len(content) > 4_000:
+        checks.append(
+            "The message is long. Lead with a compact result summary and keep lower-priority detail visibly subordinate."
+        )
+    return checks
+
+
+def _rewrite_prompt(config: PluginConfig, stage_index: int) -> str:
+    stage = config.rewrite_stages[stage_index]
+    return (
+        f"Rewrite stage {stage_index + 1} of {len(config.rewrite_stages)}: "
+        f"{stage.name}\n{stage.prompt}"
+    )
+
+
+def _attention_preview(state, buffer_id: str, config: PluginConfig) -> str:
+    draft = state.buffer_manager.resolve_for_read(state, buffer_id).text
+    metrics = _turn_metrics(state, draft)
+    entries = list(getattr(state, "entries", ()) or ())
+    current_index = max(0, len(entries) - 1)
+    user_index = _latest_user_index(entries)
+    if user_index is None:
+        user_message = "(No ordinary user message was found.)"
+        immediate_reply = "(No immediate reply was found.)"
+    else:
+        user_message = str(entries[user_index].messages[0].get("content") or "").strip()
+        immediate_reply = _first_reply_after(entries, user_index, current_index)
+
+    reasons = _trigger_reasons(metrics, config.triggers)
+    reason_text = "; ".join(reasons) if reasons else "composition was requested explicitly"
+    duration = _format_duration(metrics.elapsed_seconds)
+    memory_guidance = _memory_guidance(metrics, config)
+    checks = "\n".join(
+        f"- {check}" for check in _communication_checks(draft, metrics, config)
+    )
+    obligations = getattr(state, _OBLIGATIONS).render(
+        current_time=time.time(),
+        current_message_count=_ordinary_message_count(state),
+    )
+    rewrite = _rewrite_record(state, buffer_id)
+    if not rewrite:
+        raise ValueError("No rewrite sequence exists for the active draft")
+    stage_index = int(rewrite.get("stage_index", 0))
+    draft_changed_after_completion = (
+        stage_index >= len(config.rewrite_stages)
+        and rewrite.get("buffer_digest") != _buffer_digest(draft)
+    )
+    if draft_changed_after_completion:
+        final_index = len(config.rewrite_stages) - 1
+        next_prompt = _rewrite_prompt(config, final_index)
+        next_action = (
+            f"The draft changed after completion. Review the changed draft under the final prompt, "
+            f"edit it if needed, then call rewrite_response(buffer=\"{buffer_id}\")."
+        )
+    elif stage_index < len(config.rewrite_stages):
+        next_prompt = _rewrite_prompt(config, stage_index)
+        if stage_index == 0:
+            next_action = (
+                f"Edit {buffer_id}, then call rewrite_response(buffer=\"{buffer_id}\", "
+                "closing_obligations=[...]) with the obligation IDs this response will fulfill. "
+                "Use an empty list if the message fulfills no recorded obligation."
+            )
+        else:
+            next_action = (
+                f"Edit {buffer_id}, then call rewrite_response(buffer=\"{buffer_id}\")."
+            )
+    else:
+        next_prompt = "All configured rewrite stages are complete."
+        next_action = (
+            f"Call message_user(buffer=\"{buffer_id}\") as the sole tool call. "
+            "Any further edit requires the final rewrite stage to be accepted again."
+        )
+
+    return (
+        f"Draft buffer: {buffer_id}\n"
+        f"Composition trigger: {reason_text}\n\n"
+        "## Simulated human experience across time\n\n"
+        "These stages are temporal, not adjacent context. The exact historical text is shown to you for auditing; do not assume the human can reread or precisely recall it when the final message appears.\n\n"
+        "### 1. Turn begins: exact user message recorded in the transcript\n"
+        f"{user_message or '(empty user message)'}\n\n"
+        "### 2. Agent's immediate reply at the start of work\n"
+        f"{immediate_reply}\n\n"
+        "### 3. Attention gap: time passes and work occurs\n"
+        f"- Elapsed time: {duration}\n"
+        f"- Intervening assistant messages after the immediate reply: {metrics.intervening_messages}\n"
+        f"- Work-related tool calls: {metrics.tool_calls}\n"
+        f"- External files with recorded modifications: {len(metrics.modified_paths)} ({_modified_paths_text(metrics.modified_paths)})\n\n"
+        "The human experiences this interval as elapsed time and intermittent transcript activity. Their memory of the original wording and intermediate details may degrade during this gap.\n\n"
+        "### 4. Estimated user memory when the new message appears\n"
+        f"{memory_guidance}\n\n"
+        "### 5. Message the human will see now\n"
+        f"{draft or '(empty draft)'}\n\n"
+        "## Current obligations\n\n"
+        f"{obligations}\n\n"
+        "## Communication checks\n\n"
+        f"{checks}\n\n"
+        "## Required rewrite\n\n"
+        f"{next_prompt}\n\n"
+        f"{next_action}"
+    )
+
+
+class RecordObligation(Tool):
+    """Push a user-facing communication obligation onto the ordered list."""
+
+    name = RECORD_OBLIGATION_TOOL
+    group = "Communication"
+    reads = {"entries", "step"}
+    writes = {_OBLIGATIONS}
+
+    @staticmethod
+    def fn(
+        user_language: str,
+        predicted_response_expectations: str,
+        state=None,
+    ) -> str:
+        """Record a user obligation that must be communicated back later.
+
+        Args:
+            user_language: Concise statement of what the user asked, corrected, decided, or expects.
+            predicted_response_expectations: What a satisfactory future response should communicate.
+        """
+        user_language = str(user_language or "").strip()
+        expectations = str(predicted_response_expectations or "").strip()
+        if not user_language:
+            return "ERROR: user_language must not be empty"
+        if not expectations:
+            return "ERROR: predicted_response_expectations must not be empty"
+        entries = list(getattr(state, "entries", ()) or ())
+        source_index = _latest_user_index(entries)
+        source_message = ""
+        if source_index is not None:
+            source_message = str(entries[source_index].messages[0].get("content") or "").strip()
+        return getattr(state, _OBLIGATIONS).add(
+            user_language=user_language,
+            predicted_response_expectations=expectations,
+            source_user_message=source_message,
+            source_entry_index=source_index if source_index is not None else -1,
+            message_count=_ordinary_message_count(state),
+        )
+
+
+class ListObligations(Tool):
+    """List current obligations with time and message-count ages."""
+
+    name = LIST_OBLIGATIONS_TOOL
+    group = "Communication"
+    reads = {"entries", _OBLIGATIONS}
+
+    @staticmethod
+    def fn(state=None) -> str:
+        """List current obligations with time and message-count ages."""
+        return getattr(state, _OBLIGATIONS).render(
+            current_time=time.time(),
+            current_message_count=_ordinary_message_count(state),
+        )
+
+
+class CloseObligation(Tool):
+    """Remove an obligation that will not be fulfilled through message publication."""
+
+    name = CLOSE_OBLIGATION_TOOL
+    group = "Communication"
+    writes = {_OBLIGATIONS}
+
+    @staticmethod
+    def fn(obligation_id: str, reason: str, state=None) -> str:
+        """Remove an obligation without fulfilling it in a response.
+
+        Use this only when the user withdrew or replaced the obligation, or when
+        it is a duplicate or otherwise invalid. Normal fulfillment happens when
+        message_user successfully publishes a rewritten response.
+
+        Args:
+            obligation_id: Exact obligation identifier returned by record_obligation.
+            reason: Why removal without response fulfillment is appropriate.
+        """
+        obligation_id = str(obligation_id or "").strip()
+        reason = str(reason or "").strip()
+        if not reason:
+            return "ERROR: reason must not be empty"
+        removed = getattr(state, _OBLIGATIONS).remove(obligation_id)
+        if removed is None:
+            return f"ERROR: obligation not found: {obligation_id}"
+        return f"Removed {obligation_id}: {removed.user_language}\nReason: {reason}"
+
+
+class ComposeMessage(Tool):
+    """Preview an editable message buffer and the next required rewrite."""
+
+    group = "Communication"
+    reads = {
+        "pending_tool_calls",
+        "entries",
+        "step",
+        "buffer_manager",
+        _ACTIVE_BUFFER,
+        _OBLIGATIONS,
+        _REWRITES,
+    }
+    optional_reads = {_TURN_STARTED_AT}
+
+    @staticmethod
+    def fn(buffer: str) -> str:
+        """Preview a proposed final message buffer.
+
+        Args:
+            buffer: Active editable scratch buffer containing the proposed message.
+        """
+
+    def __init__(self, config: PluginConfig):
+        self.config = config
+
+    def available(self, state) -> bool:
+        return self.config.enabled and bool(getattr(state, _ACTIVE_BUFFER, ""))
+
+    def transform(self, state):
+        for tc, kwargs in self.pending(state):
+            try:
+                buffer_id = str(kwargs.get("buffer") or "")
+                if buffer_id != str(getattr(state, _ACTIVE_BUFFER, "") or ""):
+                    raise ValueError("compose_message requires the active message draft buffer")
+                tc.result = _attention_preview(state, buffer_id, self.config)
+            except Exception as exc:
+                tc.result = f"ERROR: {type(exc).__name__}: {exc}"
+                tc.error = True
+            self._notify(state, tc)
+        return state
+
+
+class RewriteResponse(Tool):
+    """Accept one changed draft and reveal the next configured rewrite stage."""
+
+    name = REWRITE_TOOL
+    group = "Communication"
+    reads = {"pending_tool_calls", "buffer_manager", _ACTIVE_BUFFER, _OBLIGATIONS, _REWRITES}
+    writes = {_REWRITES}
+
+    schema = {
+        "type": "function",
+        "function": {
+            "name": REWRITE_TOOL,
+            "description": "Submit a changed message draft for the current rewrite stage and receive the next stage prompt.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "buffer": {
+                        "type": "string",
+                        "description": "Active editable message buffer being rewritten.",
+                    },
+                    "closing_obligations": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "description": "On the first stage only, obligation IDs this response intends to fulfill. Use an empty list if none.",
+                    },
+                },
+                "required": ["buffer"],
+                "additionalProperties": False,
+            },
+        },
+    }
+
+    def __init__(self, config: PluginConfig):
+        self.config = config
+
+    def available(self, state) -> bool:
+        return self.config.enabled and bool(getattr(state, _ACTIVE_BUFFER, ""))
+
+    def transform(self, state):
+        for tc, kwargs in self.pending(state):
+            errors = []
+            buffer_id = str(kwargs.get("buffer") or "")
+            active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
+            if not buffer_id or buffer_id != active:
+                errors.append("buffer must be the active message draft")
+            rewrite = _rewrite_record(state, buffer_id)
+            if not rewrite:
+                errors.append("no rewrite sequence exists for this buffer")
+            elif rewrite.get("rewrite_hash") != self.config.rewrite_hash:
+                errors.append("configured rewrite stages changed after composition began")
+
+            try:
+                draft = state.buffer_manager.resolve_for_read(state, buffer_id).text
+            except (KeyError, ValueError) as exc:
+                draft = ""
+                errors.append(str(exc))
+
+            stage_index = int(rewrite.get("stage_index", 0)) if rewrite else 0
+            digest = _buffer_digest(draft)
+            if rewrite:
+                if stage_index >= len(self.config.rewrite_stages):
+                    if digest == rewrite.get("buffer_digest"):
+                        errors.append("all rewrite stages are already complete and the draft is unchanged")
+                    else:
+                        stage_index = len(self.config.rewrite_stages) - 1
+                elif digest == rewrite.get("buffer_digest"):
+                    errors.append("the buffer hash is unchanged; revise the draft before advancing")
+
+            supplied = kwargs.get("closing_obligations")
+            if stage_index == 0:
+                if supplied is None:
+                    errors.append("closing_obligations is required on the first rewrite stage")
+                    selected = []
+                elif not isinstance(supplied, list) or any(not isinstance(item, str) for item in supplied):
+                    errors.append("closing_obligations must be a list of obligation IDs")
+                    selected = []
+                else:
+                    selected = [item.strip() for item in supplied if item.strip()]
+                    if len(selected) != len(set(selected)):
+                        errors.append("closing_obligations contains duplicate IDs")
+                    known = set(getattr(state, _OBLIGATIONS).ids())
+                    unknown = [item for item in selected if item not in known]
+                    if unknown:
+                        errors.append("unknown obligation IDs: " + ", ".join(unknown))
+            else:
+                selected = list(rewrite.get("closing_obligations", [])) if rewrite else []
+                if supplied is not None:
+                    if not isinstance(supplied, list) or any(not isinstance(item, str) for item in supplied):
+                        errors.append("closing_obligations must be a list of obligation IDs")
+                    elif list(supplied) != selected:
+                        errors.append("closing_obligations may not change after the first rewrite stage")
+
+            if errors:
+                tc.result = "ERROR: " + "; ".join(errors)
+                tc.error = True
+            else:
+                rewrite["closing_obligations"] = selected
+                rewrite["buffer_digest"] = digest
+                rewrite["stage_index"] = stage_index + 1
+                rewrite["accepted_at"] = time.time()
+                if rewrite["stage_index"] >= len(self.config.rewrite_stages):
+                    tc.result = (
+                        f"Rewrite stage {stage_index + 1} accepted. All configured stages are complete. "
+                        f"Submission is unlocked; call message_user(buffer=\"{buffer_id}\") as the sole tool call. "
+                        "Any further buffer edit will lock submission again."
+                    )
+                else:
+                    tc.result = (
+                        f"Rewrite stage {stage_index + 1} accepted.\n\n"
+                        f"{_rewrite_prompt(self.config, rewrite['stage_index'])}\n\n"
+                        f"Edit {buffer_id}, then call rewrite_response(buffer=\"{buffer_id}\")."
+                    )
+            self._notify(state, tc)
+        return state
+
+
+class MessageUser(Tool):
+    """Deliver a fully rewritten message buffer and remove fulfilled obligations."""
+
+    group = "Communication"
+    reads = {"pending_tool_calls", "buffer_manager", _ACTIVE_BUFFER, _OBLIGATIONS, _REWRITES}
+
+    @staticmethod
+    def fn(buffer: str) -> str:
+        """Deliver a fully rewritten message buffer to the human.
+
+        Args:
+            buffer: Active buffer whose complete contents should be delivered.
+        """
+
+    def __init__(self, config: PluginConfig):
+        self.config = config
+
+    def available(self, state) -> bool:
+        if not self.config.enabled:
+            return False
+        buffer_id = str(getattr(state, _ACTIVE_BUFFER, "") or "")
+        return bool(buffer_id and _delivery_status(state, self.config, buffer_id)[0])
+
+    def transform(self, state):
+        for tc, kwargs in self.pending(state):
+            buffer_id = str(kwargs.get("buffer") or "")
+            current, reason = _delivery_status(state, self.config, buffer_id)
+            if not current:
+                tc.result = f"ERROR: {reason} Complete the required rewrite_response stages."
+            else:
+                tc.result = (
+                    "ERROR: message_user must be the sole tool call in its assistant response. "
+                    "Do not combine final delivery with other actions."
+                )
+            tc.error = True
+            self._notify(state, tc)
+        return state
+
+
+class CommunicationProtocolPrompt(RenderTransformRegistrar):
+    """Attach the composition protocol to the latest user turn for model rendering."""
+
+    reads = {"entries"}
+    writes = {"entries"}
+
+    def __call__(self, state):
+        entries = list(getattr(state, "entries", ()) or ())
+        user_index = _latest_user_index(entries)
+        if user_index is None:
+            return state
+        entries[user_index].register_render_transform(
+            MODEL_RENDER_CHANNEL,
+            self._transform,
+            name="human attention composition protocol",
+        )
+        return state
+
+    @staticmethod
+    def _transform(messages, _state):
+        block = f"\n\n=== [developer] ===\n{_PROTOCOL_GUIDANCE}"
+        rendered = []
+        appended = False
+        for message in messages:
+            if not appended and isinstance(message, dict) and message.get("role") == "user":
+                rendered.append({
+                    **message,
+                    "content": str(message.get("content") or "") + block,
+                })
+                appended = True
+            else:
+                rendered.append(message)
+        return rendered
+
+
+def register_features(builder, *, session, config):
+    plugin_config = _load_config()
+    if not plugin_config.enabled:
+        return
+    builder.add(Feature(
+        name="guarded_message_composition",
+        components=[
+            MessageCompositionGuard(plugin_config),
+            RecordObligation(),
+            ListObligations(),
+            CloseObligation(),
+            ComposeMessage(plugin_config),
+            RewriteResponse(plugin_config),
+            MessageUser(plugin_config),
+            CommunicationProtocolPrompt(),
+        ],
+        order=[
+            AppendInput,
+            MessageCompositionGuard,
+            TurnCounter,
+            ToolDispatchStart,
+            Tool,
+            ConsolidateToolResults,
+            CompressToolResults,
+            CommunicationProtocolPrompt,
+            ExcludeForgotten,
+            MessageRenderer,
+        ],
+    ))
