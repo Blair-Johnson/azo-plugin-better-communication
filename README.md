@@ -8,7 +8,7 @@ Messages shorter than `min_trigger_words` bypass the rewrite protocol entirely; 
 
 `record_obligation(user_language=..., predicted_response_expectations=...)` pushes an item onto the ordered obligation list and retains the source user message. `list_obligations()` shows every item with its age in elapsed time and transcript messages. The list has no open/closed statuses: fulfilled obligations are removed only after `message_user` successfully publishes a response that selected them for closure.
 
-`close_obligation(obligation_id=..., reason=...)` removes an item without publication. It is intended for withdrawn, replaced, duplicate, or invalid obligations rather than normal fulfillment.
+`close_obligation(obligation_id=..., reason=...)` is an escape hatch that removes an item without publication. It can clear withdrawn, replaced, duplicate, invalid, or stale fulfilled obligations. If a draft selected the obligation for closure, the tool also detaches that selection so the draft remains publishable.
 
 ## Rewrite protocol
 
@@ -25,7 +25,7 @@ rewrite_response(
 )
 ```
 
-The first call selects the obligations the response intends to fulfill. Each call requires a buffer hash different from the previous accepted version and returns the next configured rewrite prompt. After the final stage, `message_user(buffer=...)` becomes available. Successful publication removes the selected obligations atomically.
+The first call selects the obligations the response intends to fulfill. Later calls use only `rewrite_response(buffer="buf_...")`; the plugin preserves the original obligation selection automatically. Each call requires a buffer hash different from the previous accepted version and returns the next configured rewrite prompt. All communication tools remain visible throughout the lifecycle; calls made at the wrong point return an error that identifies the valid next action. After the final stage, a successful `message_user(buffer=...)` call remains in the transcript with its success result, and the accepted buffer content is appended as the next assistant message. Publication removes the selected obligations atomically.
 
 ## Install
 

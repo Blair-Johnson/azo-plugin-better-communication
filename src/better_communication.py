@@ -12,7 +12,7 @@ import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from agent_utils import Feature, Tool, ToolCall, estimate_tokens
+from agent_utils import Entry, Feature, Tool, ToolCall, estimate_tokens
 from agent_utils.components import (
     AppendInput,
     CompressToolResults,
@@ -33,9 +33,11 @@ RECORD_OBLIGATION_TOOL = "record_obligation"
 LIST_OBLIGATIONS_TOOL = "list_obligations"
 CLOSE_OBLIGATION_TOOL = "close_obligation"
 _TURN_STARTED_AT = "_communication_turn_started_at"
+_TURN_USER_ENTRY_INDEX = "_communication_turn_user_entry_index"
 _ACTIVE_BUFFER = "_communication_active_buffer"
 _OBLIGATIONS = "_communication_obligations"
 _REWRITES = "_communication_rewrites"
+_PENDING_PUBLICATIONS = "_communication_pending_publications"
 _CONFIG_ENV = "AZO_BETTER_COMMUNICATION_CONFIG"
 _CONFIG_NAME = "better_communication.json"
 _ENTRY_METADATA_KEY = "better_communication"
@@ -552,6 +554,7 @@ def _begin_rewrite(
         "rewrite_hash": config.rewrite_hash,
         "closing_obligations": None,
         "origin": origin,
+        "previewed": False,
         "started_at": time.time(),
     }
 
@@ -585,6 +588,31 @@ def _delivery_status(state, config: PluginConfig, buffer_id: str) -> tuple[bool,
     return True, "All rewrite stages are complete and delivery is unlocked."
 
 
+def _record_new_user_turn(state) -> bool:
+    entries = list(getattr(state, "entries", ()) or ())
+    if not entries:
+        return False
+    entry = entries[-1]
+    if getattr(entry, "role", "") != "user" or getattr(
+        entry, "system_generated", False
+    ):
+        return False
+
+    entry_index = int(getattr(entry, "index", -1))
+    previous_index = int(getattr(state, _TURN_USER_ENTRY_INDEX, -1))
+    started_at = float(getattr(state, _TURN_STARTED_AT, 0.0) or 0.0)
+    if entry_index == previous_index and started_at > 0.0:
+        return False
+
+    setattr(state, _TURN_STARTED_AT, time.time())
+    setattr(state, _TURN_USER_ENTRY_INDEX, entry_index)
+    active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
+    if active:
+        getattr(state, _REWRITES).pop(active, None)
+    setattr(state, _ACTIVE_BUFFER, "")
+    return True
+
+
 def _entry_is_published(entry: Any) -> bool:
     metadata = getattr(entry, "metadata", {}) or {}
     record = metadata.get(_ENTRY_METADATA_KEY, {}) if isinstance(metadata, dict) else {}
@@ -604,31 +632,24 @@ class MessageCompositionGuard:
         _REWRITES,
         _DEFERRED_EAGER_TOOL_NAMES,
     }
-    optional_reads = {_TURN_STARTED_AT}
+    optional_reads = {_TURN_STARTED_AT, _DEFERRED_EAGER_TOOL_NAMES}
     init = {
         _ACTIVE_BUFFER: str,
         _OBLIGATIONS: ObligationList,
         _REWRITES: dict,
-        _DEFERRED_EAGER_TOOL_NAMES: set,
     }
 
     def __init__(self, config: PluginConfig):
         self.config = config
 
     def __call__(self, state):
-        deferred_names = getattr(state, _DEFERRED_EAGER_TOOL_NAMES)
-        deferred_names.add(MESSAGE_USER_TOOL)
+        deferred_names = getattr(state, _DEFERRED_EAGER_TOOL_NAMES, None)
+        if isinstance(deferred_names, set):
+            deferred_names.discard(MESSAGE_USER_TOOL)
         if not state.entries:
             return state
         entry = state.entries[-1]
         role = getattr(entry, "role", "")
-        if role == "user" and not getattr(entry, "system_generated", False):
-            setattr(state, _TURN_STARTED_AT, time.time())
-            active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
-            if active:
-                getattr(state, _REWRITES).pop(active, None)
-            setattr(state, _ACTIVE_BUFFER, "")
-            return state
         if role != "assistant" or not self.config.enabled:
             return state
 
@@ -637,9 +658,7 @@ class MessageCompositionGuard:
         if _entry_is_published(entry):
             setattr(state, _ACTIVE_BUFFER, "")
             return state
-        calls = list(getattr(entry, "tool_calls", None) or [])
-        if calls:
-            self._commit_message_user(state, entry, calls)
+        if getattr(entry, "tool_calls", None):
             return state
 
         content = _assistant_content(entry)
@@ -648,42 +667,6 @@ class MessageCompositionGuard:
         if reasons:
             self._stage_text_draft(state, entry, content)
         return state
-
-    def _commit_message_user(self, state, entry, calls: list[ToolCall]) -> None:
-        if len(calls) != 1 or calls[0].name != MESSAGE_USER_TOOL:
-            return
-        buffer_id = calls[0].parsed_args.get("buffer")
-        if not isinstance(buffer_id, str) or not buffer_id:
-            return
-        current, _ = _delivery_status(state, self.config, buffer_id)
-        if not current:
-            return
-        content = state.buffer_manager.resolve_for_read(state, buffer_id).text
-        if not content.strip():
-            return
-
-        rewrite = _rewrite_record(state, buffer_id) or {}
-        closing_obligations = list(rewrite.get("closing_obligations", []))
-        original = dict(entry.messages[0])
-        original.pop("tool_calls", None)
-        original["content"] = content
-        entry.messages = [original]
-        entry.tool_calls = None
-        entry.tokens = estimate_tokens(content)
-        metadata = dict(getattr(entry, "metadata", {}) or {})
-        metadata[_ENTRY_METADATA_KEY] = {
-            "published": True,
-            "published_at": time.time(),
-            "buffer_digest": _buffer_digest(content),
-            "rewrite_hash": self.config.rewrite_hash,
-            "rewrite_stages": [stage.name for stage in self.config.rewrite_stages],
-            "closed_obligations": closing_obligations,
-        }
-        entry.metadata = metadata
-        getattr(state, _OBLIGATIONS).remove_many(closing_obligations)
-        getattr(state, _REWRITES).pop(buffer_id, None)
-        state.pending_tool_calls = []
-        setattr(state, _ACTIVE_BUFFER, "")
 
     def _stage_text_draft(self, state, entry, content: str) -> None:
         buffer_id, _ = state.buffer_manager.create_scratch_buffer(
@@ -933,23 +916,25 @@ class ListObligations(Tool):
 
 
 class CloseObligation(Tool):
-    """Remove an obligation that will not be fulfilled through message publication."""
+    """Remove an obligation and detach it from any active publication selection."""
 
     name = CLOSE_OBLIGATION_TOOL
     group = "Communication"
-    writes = {_OBLIGATIONS}
+    reads = {_REWRITES}
+    writes = {_OBLIGATIONS, _REWRITES}
 
     @staticmethod
     def fn(obligation_id: str, reason: str, state=None) -> str:
-        """Remove an obligation without fulfilling it in a response.
+        """Remove an obligation without requiring message publication.
 
-        Use this only when the user withdrew or replaced the obligation, or when
-        it is a duplicate or otherwise invalid. Normal fulfillment happens when
-        message_user successfully publishes a rewritten response.
+        Use this escape hatch when an obligation was withdrawn, replaced,
+        duplicated, recorded incorrectly, or already fulfilled through a short
+        response that bypassed the publication protocol. If an active draft had
+        selected the obligation, the selection is updated automatically.
 
         Args:
             obligation_id: Exact obligation identifier returned by record_obligation.
-            reason: Why removal without response fulfillment is appropriate.
+            reason: Why removal without response publication is appropriate.
         """
         obligation_id = str(obligation_id or "").strip()
         reason = str(reason or "").strip()
@@ -958,7 +943,22 @@ class CloseObligation(Tool):
         removed = getattr(state, _OBLIGATIONS).remove(obligation_id)
         if removed is None:
             return f"ERROR: obligation not found: {obligation_id}"
-        return f"Removed {obligation_id}: {removed.user_language}\nReason: {reason}"
+
+        detached = 0
+        for rewrite in getattr(state, _REWRITES).values():
+            selected = rewrite.get("closing_obligations")
+            if isinstance(selected, list) and obligation_id in selected:
+                rewrite["closing_obligations"] = [
+                    item for item in selected if item != obligation_id
+                ]
+                detached += 1
+        suffix = (
+            f"\nDetached from {detached} draft selection(s)." if detached else ""
+        )
+        return (
+            f"Removed {obligation_id}: {removed.user_language}\n"
+            f"Reason: {reason}{suffix}"
+        )
 
 
 class ComposeMessage(Tool):
@@ -999,14 +999,23 @@ class ComposeMessage(Tool):
                     raise ValueError("compose_message requires a buffer")
                 active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
                 if active and buffer_id != active:
-                    raise ValueError(
-                        f"compose_message already has active draft {active}; "
-                        "finish or abandon it before composing another buffer"
-                    )
+                    try:
+                        state.buffer_manager.resolve_for_read(state, active)
+                    except (KeyError, ValueError):
+                        getattr(state, _REWRITES).pop(active, None)
+                        setattr(state, _ACTIVE_BUFFER, "")
+                        active = ""
+                    else:
+                        raise ValueError(
+                            f"composition is already active for {active}; continue that "
+                            "buffer with rewrite_response or message_user"
+                        )
+
                 buffer = state.buffer_manager.resolve_for_read(state, buffer_id)
                 if getattr(buffer, "readonly", False):
                     raise ValueError("compose_message requires an editable buffer")
-                if not active or not _rewrite_record(state, buffer_id):
+                rewrite = _rewrite_record(state, buffer_id)
+                if not active or not rewrite:
                     _begin_rewrite(
                         state,
                         self.config,
@@ -1014,7 +1023,43 @@ class ComposeMessage(Tool):
                         buffer.text,
                         origin="voluntary",
                     )
-                tc.result = _attention_preview(state, buffer_id, self.config)
+                    rewrite = _rewrite_record(state, buffer_id)
+                elif rewrite.get("rewrite_hash") != self.config.rewrite_hash:
+                    origin = str(rewrite.get("origin") or "voluntary")
+                    _begin_rewrite(
+                        state,
+                        self.config,
+                        buffer_id,
+                        buffer.text,
+                        origin=origin,
+                    )
+                    rewrite = _rewrite_record(state, buffer_id)
+
+                if not bool(rewrite.get("previewed", False)):
+                    rewrite["previewed"] = True
+                    tc.result = _attention_preview(state, buffer_id, self.config)
+                    tc.error = False
+                else:
+                    stage_index = int(rewrite.get("stage_index", 0))
+                    digest_changed = rewrite.get("buffer_digest") != _buffer_digest(
+                        buffer.text
+                    )
+                    if stage_index < len(self.config.rewrite_stages):
+                        raise ValueError(
+                            f"composition is already active at rewrite stage "
+                            f"{stage_index + 1}; edit {buffer_id} and call "
+                            f"rewrite_response(buffer=\"{buffer_id}\")"
+                        )
+                    if digest_changed:
+                        raise ValueError(
+                            f"the accepted draft changed; call "
+                            f"rewrite_response(buffer=\"{buffer_id}\") to reaccept "
+                            "the final stage"
+                        )
+                    raise ValueError(
+                        f"all rewrite stages are complete; call "
+                        f"message_user(buffer=\"{buffer_id}\") as the sole tool call"
+                    )
             except Exception as exc:
                 tc.result = f"ERROR: {type(exc).__name__}: {exc}"
                 tc.error = True
@@ -1026,6 +1071,7 @@ class RewriteResponse(Tool):
     """Accept one changed draft and reveal the next configured rewrite stage."""
 
     name = REWRITE_TOOL
+    description = "Submit a changed message draft for the current rewrite stage and receive the next stage prompt."
     group = "Communication"
     reads = {"pending_tool_calls", "buffer_manager", _ACTIVE_BUFFER, _OBLIGATIONS, _REWRITES}
     writes = {_REWRITES}
@@ -1054,11 +1100,27 @@ class RewriteResponse(Tool):
         },
     }
 
+    @staticmethod
+    def fn(
+        buffer: str,
+        closing_obligations: list[str] | None = None,
+    ) -> str:
+        """Submit a changed draft for the current rewrite stage.
+
+        The first call must select the obligations the response will fulfill.
+        Later calls preserve that selection automatically and should omit
+        ``closing_obligations``.
+
+        Args:
+            buffer: Active editable message buffer being rewritten.
+            closing_obligations: On the first stage only, obligation IDs this response intends to fulfill. Use an empty list if none.
+        """
+
     def __init__(self, config: PluginConfig):
         self.config = config
 
     def available(self, state) -> bool:
-        return self.config.enabled and bool(getattr(state, _ACTIVE_BUFFER, ""))
+        return self.config.enabled
 
     def transform(self, state):
         for tc, kwargs in self.pending(state):
@@ -1108,14 +1170,17 @@ class RewriteResponse(Tool):
                         errors.append("unknown obligation IDs: " + ", ".join(unknown))
             else:
                 selected = list(rewrite.get("closing_obligations", [])) if rewrite else []
-                if supplied is not None:
-                    if not isinstance(supplied, list) or any(not isinstance(item, str) for item in supplied):
-                        errors.append("closing_obligations must be a list of obligation IDs")
-                    elif list(supplied) != selected:
-                        errors.append("closing_obligations may not change after the first rewrite stage")
+                if supplied not in (None, []):
+                    errors.append(
+                        "closing_obligations is accepted only on the first rewrite stage; "
+                        "later stages preserve the original selection automatically"
+                    )
 
             if errors:
-                tc.result = "ERROR: " + "; ".join(errors)
+                tc.result = (
+                    "ERROR: " + "; ".join(errors) + ". "
+                    + self._next_action(state, buffer_id)
+                )
                 tc.error = True
             else:
                 rewrite["closing_obligations"] = selected
@@ -1138,42 +1203,178 @@ class RewriteResponse(Tool):
         return state
 
 
+    def _next_action(self, state, buffer_id: str) -> str:
+        active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
+        if not active:
+            return "Put the complete response in an editable buffer and call compose_message(buffer=...)."
+        if buffer_id != active:
+            return f"Call rewrite_response(buffer=\"{active}\") for the active draft."
+        rewrite = _rewrite_record(state, active)
+        if not rewrite:
+            return f"Call compose_message(buffer=\"{active}\") to initialize its rewrite sequence."
+        if rewrite.get("rewrite_hash") != self.config.rewrite_hash:
+            return f"Call compose_message(buffer=\"{active}\") to restart the stages under the current rewrite configuration."
+        stage_index = int(rewrite.get("stage_index", 0))
+        try:
+            draft = state.buffer_manager.resolve_for_read(state, active).text
+        except (KeyError, ValueError):
+            return "Put the response in a valid editable buffer and call compose_message with that buffer."
+        if stage_index >= len(self.config.rewrite_stages):
+            if rewrite.get("buffer_digest") == _buffer_digest(draft):
+                return f"Call message_user(buffer=\"{active}\") as the sole tool call."
+            return f"Call rewrite_response(buffer=\"{active}\") to reaccept the changed final draft."
+        return f"Edit {active} for rewrite stage {stage_index + 1}, then call rewrite_response again."
+
+
 class MessageUser(Tool):
-    """Deliver a fully rewritten message buffer and remove fulfilled obligations."""
+    """Publish an accepted message buffer through a visible terminal tool call."""
 
     group = "Communication"
     reads = {"pending_tool_calls", "buffer_manager", _ACTIVE_BUFFER, _OBLIGATIONS, _REWRITES}
+    writes = {_PENDING_PUBLICATIONS}
+    init = {_PENDING_PUBLICATIONS: dict}
 
     @staticmethod
     def fn(buffer: str) -> str:
-        """Deliver a fully rewritten message buffer to the human.
+        """Publish a fully rewritten message buffer to the human.
+
+        A successful call remains visible in the transcript with its tool result.
+        The accepted buffer content is then appended as the next assistant message.
 
         Args:
-            buffer: Active buffer whose complete contents should be delivered.
+            buffer: Active buffer whose complete contents should be published.
         """
 
     def __init__(self, config: PluginConfig):
         self.config = config
 
     def available(self, state) -> bool:
-        if not self.config.enabled:
-            return False
-        buffer_id = str(getattr(state, _ACTIVE_BUFFER, "") or "")
-        return bool(buffer_id and _delivery_status(state, self.config, buffer_id)[0])
+        return self.config.enabled
 
     def transform(self, state):
+        pending_calls = list(getattr(state, "pending_tool_calls", ()) or ())
         for tc, kwargs in self.pending(state):
             buffer_id = str(kwargs.get("buffer") or "")
-            current, reason = _delivery_status(state, self.config, buffer_id)
-            if not current:
-                tc.result = f"ERROR: {reason} Complete the required rewrite_response stages."
-            else:
-                tc.result = (
-                    "ERROR: message_user must be the sole tool call in its assistant response. "
-                    "Do not combine final delivery with other actions."
+            errors = []
+            if len(pending_calls) != 1 or pending_calls[0].id != tc.id:
+                errors.append(
+                    "message_user must be the sole tool call in its assistant response"
                 )
-            tc.error = True
+            if not buffer_id:
+                errors.append("buffer is required")
+                current = False
+                reason = "No message buffer was supplied."
+            else:
+                current, reason = _delivery_status(state, self.config, buffer_id)
+                if not current:
+                    errors.append(reason)
+
+            content = ""
+            if current:
+                content = state.buffer_manager.resolve_for_read(state, buffer_id).text
+                if not content.strip():
+                    errors.append("the accepted message buffer is empty")
+
+            if errors:
+                tc.result = "ERROR: " + "; ".join(errors) + ". " + self._next_action(
+                    state, buffer_id
+                )
+                tc.error = True
+            else:
+                rewrite = _rewrite_record(state, buffer_id) or {}
+                closing_obligations = list(rewrite.get("closing_obligations", []))
+                getattr(state, _PENDING_PUBLICATIONS)[tc.id] = {
+                    "buffer_id": buffer_id,
+                    "content": content,
+                    "closing_obligations": closing_obligations,
+                    "accepted_at": time.time(),
+                }
+                tc.result = (
+                    f"Message published successfully from {buffer_id}. "
+                    "The accepted buffer content has been added as the next assistant message."
+                )
+                tc.error = False
             self._notify(state, tc)
+        return state
+
+    def _next_action(self, state, buffer_id: str) -> str:
+        active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
+        if not active:
+            return "Put the complete response in an editable buffer and call compose_message(buffer=...)."
+        if buffer_id != active:
+            return f"The active draft is {active}; continue that buffer or call close_obligation for stale obligations."
+        rewrite = _rewrite_record(state, active)
+        if not rewrite:
+            return f"Call compose_message(buffer=\"{active}\") to initialize its rewrite sequence."
+        if rewrite.get("rewrite_hash") != self.config.rewrite_hash:
+            return f"Call compose_message(buffer=\"{active}\") to refresh the draft under the current rewrite configuration."
+        stage_index = int(rewrite.get("stage_index", 0))
+        if stage_index < len(self.config.rewrite_stages):
+            return f"Edit {active} and call rewrite_response(buffer=\"{active}\")."
+        return f"If the draft changed, call rewrite_response(buffer=\"{active}\"); otherwise call message_user again as the sole tool call."
+
+
+class AppendPublishedMessage:
+    """Append accepted buffer content after the visible message_user tool result."""
+
+    reads = {
+        "entries",
+        "last_tool_calls",
+        _ACTIVE_BUFFER,
+        _OBLIGATIONS,
+        _REWRITES,
+        _PENDING_PUBLICATIONS,
+    }
+    writes = {
+        "entries",
+        "last_tool_calls",
+        _ACTIVE_BUFFER,
+        _OBLIGATIONS,
+        _REWRITES,
+        _PENDING_PUBLICATIONS,
+    }
+
+    def __init__(self, config: PluginConfig):
+        self.config = config
+
+    def __call__(self, state):
+        publications = getattr(state, _PENDING_PUBLICATIONS)
+        appended = False
+        for tc in list(getattr(state, "last_tool_calls", ()) or ()):
+            payload = publications.pop(tc.id, None)
+            if not payload:
+                continue
+            buffer_id = str(payload["buffer_id"])
+            content = str(payload["content"])
+            closing_obligations = list(payload.get("closing_obligations", []))
+            metadata = {
+                _ENTRY_METADATA_KEY: {
+                    "published": True,
+                    "published_at": time.time(),
+                    "publication_tool_call_id": tc.id,
+                    "buffer_id": buffer_id,
+                    "buffer_digest": _buffer_digest(content),
+                    "rewrite_hash": self.config.rewrite_hash,
+                    "rewrite_stages": [
+                        stage.name for stage in self.config.rewrite_stages
+                    ],
+                    "closed_obligations": closing_obligations,
+                }
+            }
+            state.entries.append(Entry(
+                messages=[{"role": "assistant", "content": content}],
+                index=len(state.entries),
+                step=getattr(state, "step", 0),
+                tokens=estimate_tokens(content),
+                metadata=metadata,
+            ))
+            getattr(state, _OBLIGATIONS).remove_many(closing_obligations)
+            getattr(state, _REWRITES).pop(buffer_id, None)
+            if str(getattr(state, _ACTIVE_BUFFER, "") or "") == buffer_id:
+                setattr(state, _ACTIVE_BUFFER, "")
+            appended = True
+        if appended:
+            state.last_tool_calls = []
         return state
 
 
@@ -1181,12 +1382,23 @@ class CommunicationProtocolSystemPrompt(RenderTransformRegistrar):
     """Register configurable communication guidance on the model-channel system prompt."""
 
     reads = {"entries"}
+    writes = {
+        _TURN_STARTED_AT,
+        _TURN_USER_ENTRY_INDEX,
+        _ACTIVE_BUFFER,
+        _REWRITES,
+    }
+    init = {
+        _TURN_STARTED_AT: float,
+        _TURN_USER_ENTRY_INDEX: int,
+    }
     transform_name = "human attention composition system prompt"
 
     def __init__(self, config: PluginConfig):
         self.guidance = config.system_prompt_guidance
 
     def __call__(self, state):
+        _record_new_user_turn(state)
         if not state.entries:
             return state
         entry = state.entries[0]
@@ -1249,6 +1461,7 @@ def register_features(builder, *, session, config):
             ComposeMessage(plugin_config),
             RewriteResponse(plugin_config),
             MessageUser(plugin_config),
+            AppendPublishedMessage(plugin_config),
             CommunicationProtocolSystemPrompt(plugin_config),
         ],
         order=[
@@ -1258,6 +1471,7 @@ def register_features(builder, *, session, config):
             ToolDispatchStart,
             Tool,
             ConsolidateToolResults,
+            AppendPublishedMessage,
             CompressToolResults,
             SystemPromptSkillList,
             CommunicationProtocolSystemPrompt,
