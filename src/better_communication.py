@@ -232,7 +232,7 @@ class PluginConfig:
         self.rewrite_hash = rewrite_hash
 
 
-def _config_path() -> Path:
+def _config_path(*, writable: bool = False) -> Path:
     override = os.environ.get(_CONFIG_ENV, "").strip()
     if override:
         return Path(override).expanduser()
@@ -245,7 +245,7 @@ def _config_path() -> Path:
         ).expanduser()
         data_root = xdg_root / "agent-zoo"
     installed = data_root / "plugin-configs" / "azo-plugin-better-communication" / _CONFIG_NAME
-    if installed.exists():
+    if writable or installed.exists():
         return installed
     return Path(__file__).resolve().parent.parent / _CONFIG_NAME
 
@@ -1456,7 +1456,7 @@ def _settings_document(path: Path) -> dict[str, Any]:
     try:
         document = json.loads(path.read_text(encoding="utf-8"))
     except FileNotFoundError:
-        raise SettingError("Cannot read plugin configuration") from None
+        raise SettingError("Create the user plugin configuration before editing defaults") from None
     except (OSError, UnicodeError, json.JSONDecodeError):
         raise SettingError("Cannot read plugin configuration") from None
     if not isinstance(document, dict):
@@ -1467,7 +1467,8 @@ def _settings_document(path: Path) -> dict[str, Any]:
 def _save_enabled(value) -> None:
     temporary = None
     try:
-        path = _config_path().resolve()
+        # The bundled read fallback is never an implicit write target.
+        path = _config_path(writable=True).resolve()
         document = _settings_document(path)
         if type(value) is not bool:
             raise SettingError("Expected a boolean")
@@ -1491,11 +1492,11 @@ def _save_enabled(value) -> None:
 
 def _register_settings(builder) -> None:
     builder.add(Feature("better_communication_settings", components=[
-        Setting("better_communication.enabled", "Enabled", "bool",
+        Setting("better_communication.enabled", "Enabled by default", "bool",
                 get=lambda ctx: bool(_settings_document(_config_path()).get("enabled", True)),
                 set=lambda ctx, value: _save_enabled(value),
                 group="Better communication", apply="reload",
-                help="Configured value; reload to change the loaded communication tools."),
+                help="Saved default, not current tool status; reload to change loaded communication tools."),
     ], order=[Setting]))
 
 

@@ -121,3 +121,30 @@ def test_unreadable_file_is_safe(settings_file, monkeypatch):
     assert "private path" not in json.dumps(row)
     with pytest.raises(SettingError):
         plugin._save_enabled(True)
+
+
+def test_missing_user_config_never_writes_bundled_source(tmp_path, monkeypatch):
+    monkeypatch.delenv("AZO_BETTER_COMMUNICATION_CONFIG", raising=False)
+    monkeypatch.setenv("AGENT_ZOO_INSTALL_ROOT", str(tmp_path))
+    bundled = plugin._config_path()
+    before = bundled.read_bytes()
+    target = plugin._config_path(writable=True)
+    assert target != bundled and not target.exists()
+    session = SimpleNamespace(state=State())
+    builder = PipelineBuilder(session)
+    plugin._register_settings(builder)
+    reg = SettingsRegistry([c for c in builder.build() if isinstance(c, Setting)])
+    ctx = SettingsContext(session)
+    assert reg.catalog(ctx)[0]["value"] is bool(load(bundled).get("enabled", True))
+    assert not edit(reg, ctx, False)["ok"]
+    assert bundled.read_bytes() == before
+    assert not target.exists()
+
+
+def test_saved_default_ignores_registration_and_session_state(settings_file):
+    reg, ctx, builder = registry({"better_communication": {"enabled": True}})
+    ctx.state.better_communication_enabled = True
+    assert reg.catalog(ctx)[0]["value"] is False
+    assert edit(reg, ctx, True)["ok"]
+    assert not builder.has("guarded_message_composition")
+    assert ctx.state.better_communication_enabled is True

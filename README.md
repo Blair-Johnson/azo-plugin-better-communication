@@ -51,3 +51,8 @@ an installer-disabled plugin is not loaded and has no settings UI.
 The existing `AZO_BETTER_COMMUNICATION_CONFIG` path override remains authoritative.
 Edits preserve other JSON values and file permissions. Prompts, rewrite/memory
 rules, and nullable trigger thresholds are intentionally not exposed.
+
+The row reads the saved default, not session state. If no user configuration
+exists, bundled defaults remain readable but saves fail safely: install/copy the
+plugin configuration first. `/config` never implicitly writes the bundled source
+or creates a full prompt/default document merely to change one boolean.
