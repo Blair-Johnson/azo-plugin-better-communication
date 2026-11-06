@@ -6,11 +6,15 @@ from collections.abc import Mapping
 import hashlib
 import json
 import os
+import stat
+import tempfile
 import re
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
+
+from agent_zoo.runtime.settings import Setting, SettingError
 
 from agent_utils import Entry, Feature, Tool, ToolCall, estimate_tokens
 from agent_utils.components import (
@@ -1447,7 +1451,56 @@ class CommunicationProtocolSystemPrompt(RenderTransformRegistrar):
         return str(content).rstrip() + "\n\n" + block
 
 
+def _settings_document(path: Path) -> dict[str, Any]:
+    """Read strictly so edits never replace malformed configuration."""
+    try:
+        document = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        raise SettingError("Cannot read plugin configuration") from None
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        raise SettingError("Cannot read plugin configuration") from None
+    if not isinstance(document, dict):
+        raise SettingError("Plugin configuration must be an object")
+    return document
+
+
+def _save_enabled(value) -> None:
+    temporary = None
+    try:
+        path = _config_path().resolve()
+        document = _settings_document(path)
+        if type(value) is not bool:
+            raise SettingError("Expected a boolean")
+        document["enabled"] = value
+        path.parent.mkdir(parents=True, exist_ok=True)
+        mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=path.parent,
+                                         prefix="." + path.name, delete=False) as stream:
+            temporary = Path(stream.name)
+            os.fchmod(stream.fileno(), mode)
+            stream.write(json.dumps(document, indent=2) + "\n")
+        os.replace(temporary, path)
+    except (OSError, UnicodeError, ValueError) as exc:
+        if isinstance(exc, SettingError):
+            raise
+        raise SettingError("Cannot save plugin configuration") from None
+    finally:
+        if temporary is not None:
+            temporary.unlink(missing_ok=True)
+
+
+def _register_settings(builder) -> None:
+    builder.add(Feature("better_communication_settings", components=[
+        Setting("better_communication.enabled", "Enabled", "bool",
+                get=lambda ctx: bool(_settings_document(_config_path()).get("enabled", True)),
+                set=lambda ctx, value: _save_enabled(value),
+                group="Better communication", apply="reload",
+                help="Configured value; reload to change the loaded communication tools."),
+    ], order=[Setting]))
+
+
 def register_features(builder, *, session, config):
+    _register_settings(builder)
     plugin_config = _load_config()
     if not plugin_config.enabled:
         return

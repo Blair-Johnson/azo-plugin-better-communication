@@ -42,3 +42,12 @@ Edit the repository `better_communication.json`, reinstall with `azo-plugin inst
 ## Prototype boundary
 
 The plugin synthesizes `compose_message` by coordinating the stored assistant message, `Entry.tool_calls`, and `state.pending_tool_calls`, so interception remains experimental. Published messages carry durable metadata on their transcript `Entry`, preventing reload from restaging a message that already passed through the protocol.
+
+## `/config`
+
+`better_communication.enabled` is a boolean configured value; changes require a
+backend reload. Settings remain registered when this internal flag is false, but
+an installer-disabled plugin is not loaded and has no settings UI.
+The existing `AZO_BETTER_COMMUNICATION_CONFIG` path override remains authoritative.
+Edits preserve other JSON values and file permissions. Prompts, rewrite/memory
+rules, and nullable trigger thresholds are intentionally not exposed.
