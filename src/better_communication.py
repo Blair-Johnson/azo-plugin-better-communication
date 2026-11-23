@@ -6,29 +6,38 @@ from collections.abc import Mapping
 import hashlib
 import json
 import os
+import re
 import stat
 import tempfile
-import re
 import time
 import uuid
 from pathlib import Path
 from typing import Any, Callable
 
-from agent_zoo.runtime.settings import Setting, SettingError
-
-from agent_utils import Entry, Feature, Tool, ToolCall, estimate_tokens
-from agent_utils.components import (
+from agent_utils.core.events import (
+    Event,
+    InputReceived,
+    RenderRequested,
+    RunToolCall,
+    ToolBatchCompleted,
+    ToolCallFinished,
+)
+from agent_utils.core.pipeline import EmitFn, Feature
+from agent_utils.core.state import MODEL_RENDER_CHANNEL, Entry, State, ToolCall
+from agent_utils.core.tool import Tool
+from agent_utils.features.core import (
     AppendInput,
     CompressToolResults,
     ConsolidateToolResults,
     ExcludeForgotten,
+    IoFence,
     MessageRenderer,
     RenderTransformRegistrar,
-    ToolDispatchStart,
+    ToolRunner,
     TurnCounter,
 )
-from agent_utils.types import MODEL_RENDER_CHANNEL
-from agents.system_prompt import SystemPromptSkillList
+from agent_zoo.features.settings import Setting, SettingError
+from agent_zoo.features.system_prompt import SystemPromptSkillList
 
 COMPOSE_TOOL = "compose_message"
 REWRITE_TOOL = "rewrite_response"
@@ -54,6 +63,12 @@ _COMMUNICATION_TOOL_NAMES = frozenset({
     LIST_OBLIGATIONS_TOOL,
     CLOSE_OBLIGATION_TOOL,
 })
+
+
+def _estimate_tokens(text: str) -> int:
+    return max(0, len(text or "") // 4)
+
+
 class RewriteStage:
     __slots__ = ("name", "prompt")
 
@@ -365,6 +380,7 @@ def _load_config() -> PluginConfig:
         rewrite_hash=rewrite_hash,
     )
 
+
 def _assistant_content(entry: Any) -> str:
     for message in getattr(entry, "messages", ()) or ():
         if isinstance(message, dict) and message.get("role") == "assistant":
@@ -479,15 +495,22 @@ def _format_duration(seconds: float) -> str:
     return f"{hours}h {minutes}m"
 
 
-def _turn_metrics(state, content: str) -> TurnMetrics:
+def _turn_metrics(state, content: str, *, incoming_assistant: bool = False) -> TurnMetrics:
     entries = list(getattr(state, "entries", ()) or ())
     user_index = _latest_user_index(entries)
     turn_start = user_index + 1 if user_index is not None else 0
-    current_index = max(turn_start, len(entries) - 1)
-    assistant_messages = sum(
-        1 for entry in entries[turn_start:]
-        if getattr(entry, "role", "") == "assistant"
-    )
+    if incoming_assistant:
+        current_index = len(entries)
+        assistant_messages = sum(
+            1 for entry in entries[turn_start:]
+            if getattr(entry, "role", "") == "assistant"
+        ) + 1
+    else:
+        current_index = max(turn_start, len(entries) - 1)
+        assistant_messages = sum(
+            1 for entry in entries[turn_start:]
+            if getattr(entry, "role", "") == "assistant"
+        )
 
     first_reply_index = None
     for index in range(turn_start, current_index):
@@ -543,6 +566,7 @@ def _buffer_digest(text: str) -> str:
 def _rewrite_record(state, buffer_id: str) -> dict[str, object] | None:
     return (getattr(state, _REWRITES, {}) or {}).get(buffer_id)
 
+
 def _begin_rewrite(
     state,
     config: PluginConfig,
@@ -552,7 +576,11 @@ def _begin_rewrite(
     origin: str,
 ) -> None:
     setattr(state, _ACTIVE_BUFFER, buffer_id)
-    getattr(state, _REWRITES)[buffer_id] = {
+    rewrites = getattr(state, _REWRITES, None)
+    if not isinstance(rewrites, dict):
+        rewrites = {}
+        setattr(state, _REWRITES, rewrites)
+    rewrites[buffer_id] = {
         "stage_index": 0,
         "buffer_digest": _buffer_digest(text),
         "rewrite_hash": config.rewrite_hash,
@@ -612,7 +640,9 @@ def _record_new_user_turn(state) -> bool:
     setattr(state, _TURN_USER_ENTRY_INDEX, entry_index)
     active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
     if active:
-        getattr(state, _REWRITES).pop(active, None)
+        rewrites = getattr(state, _REWRITES, None)
+        if isinstance(rewrites, dict):
+            rewrites.pop(active, None)
     setattr(state, _ACTIVE_BUFFER, "")
     return True
 
@@ -626,17 +656,17 @@ def _entry_is_published(entry: Any) -> bool:
 class MessageCompositionGuard:
     """Apply configured triggers, stage drafts, and enforce rewritten delivery."""
 
-    reads = {"entries", "pending_tool_calls", "buffer_manager", "step"}
+    handles = (InputReceived,)
+    reads = {"entries", "pending_tool_calls", "step"}
     writes = {
         "entries",
         "pending_tool_calls",
-        "buffer_manager",
         _ACTIVE_BUFFER,
         _OBLIGATIONS,
         _REWRITES,
         _DEFERRED_EAGER_TOOL_NAMES,
     }
-    optional_reads = {_TURN_STARTED_AT, _DEFERRED_EAGER_TOOL_NAMES}
+    optional_reads = {"buffer_manager", _TURN_STARTED_AT, _DEFERRED_EAGER_TOOL_NAMES}
     init = {
         _ACTIVE_BUFFER: str,
         _OBLIGATIONS: ObligationList,
@@ -646,33 +676,28 @@ class MessageCompositionGuard:
     def __init__(self, config: PluginConfig):
         self.config = config
 
-    def __call__(self, state):
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        assert isinstance(event, InputReceived)
         deferred_names = getattr(state, _DEFERRED_EAGER_TOOL_NAMES, None)
         if isinstance(deferred_names, set):
             deferred_names.discard(MESSAGE_USER_TOOL)
-        if not state.entries:
-            return state
-        entry = state.entries[-1]
-        role = getattr(entry, "role", "")
-        if role != "assistant" or not self.config.enabled:
-            return state
+        if not self.config.enabled:
+            return
+        msg = event.message
+        if not isinstance(msg, dict) or msg.get("role") != "assistant":
+            return
+        if msg.get("tool_calls"):
+            return
+        if getattr(state, "buffer_manager", None) is None:
+            return
 
-        if getattr(entry, "step", None) != getattr(state, "step", None):
-            return state
-        if _entry_is_published(entry):
-            setattr(state, _ACTIVE_BUFFER, "")
-            return state
-        if getattr(entry, "tool_calls", None):
-            return state
-
-        content = _assistant_content(entry)
-        metrics = _turn_metrics(state, content)
+        content = str(msg.get("content") or "")
+        metrics = _turn_metrics(state, content, incoming_assistant=True)
         reasons = _trigger_reasons(metrics, self.config.triggers)
         if reasons:
-            self._stage_text_draft(state, entry, content)
-        return state
+            self._stage_text_draft(state, msg, content)
 
-    def _stage_text_draft(self, state, entry, content: str) -> None:
+    def _stage_text_draft(self, state: State, message: dict[str, Any], content: str) -> None:
         buffer_id, _ = state.buffer_manager.create_scratch_buffer(
             content,
             path=f"<message-draft:turn-{getattr(state, 'step', 0)}>",
@@ -693,13 +718,8 @@ class MessageCompositionGuard:
                 "arguments": json.dumps({"buffer": buffer_id}),
             },
         }
-        message = entry.messages[0]
         message["content"] = ""
         message["tool_calls"] = [raw_call]
-        call = ToolCall.from_raw(raw_call)
-        entry.tool_calls = [call]
-        entry.tokens = estimate_tokens(call.raw_args)
-        state.pending_tool_calls = [call]
 
 
 def _first_reply_after(entries: list[Any], user_index: int, current_index: int) -> str:
@@ -871,11 +891,11 @@ class RecordObligation(Tool):
     reads = {"entries", "step"}
     writes = {_OBLIGATIONS}
 
-    @staticmethod
-    def fn(
+    def call(
+        self,
+        state: State,
         user_language: str,
         predicted_response_expectations: str,
-        state=None,
     ) -> str:
         """Record a user obligation that must be communicated back later.
 
@@ -910,8 +930,7 @@ class ListObligations(Tool):
     group = "Communication"
     reads = {"entries", _OBLIGATIONS}
 
-    @staticmethod
-    def fn(state=None) -> str:
+    def call(self, state: State) -> str:
         """List current obligations with time and message-count ages."""
         return getattr(state, _OBLIGATIONS).render(
             current_time=time.time(),
@@ -927,8 +946,7 @@ class CloseObligation(Tool):
     reads = {_REWRITES}
     writes = {_OBLIGATIONS, _REWRITES}
 
-    @staticmethod
-    def fn(obligation_id: str, reason: str, state=None) -> str:
+    def call(self, state: State, obligation_id: str, reason: str) -> str:
         """Remove an obligation without requiring message publication.
 
         Use this escape hatch when an obligation was withdrawn, replaced,
@@ -968,6 +986,7 @@ class CloseObligation(Tool):
 class ComposeMessage(Tool):
     """Preview an editable message buffer and the next required rewrite."""
 
+    name = COMPOSE_TOOL
     group = "Communication"
     reads = {
         "pending_tool_calls",
@@ -981,94 +1000,82 @@ class ComposeMessage(Tool):
     writes = {_ACTIVE_BUFFER, _REWRITES}
     optional_reads = {_TURN_STARTED_AT}
 
-    @staticmethod
-    def fn(buffer: str) -> str:
+    def __init__(self, config: PluginConfig):
+        super().__init__()
+        self.config = config
+
+    def available(self, state: State) -> bool:
+        return self.config.enabled
+
+    def call(self, state: State, buffer: str) -> str:
         """Start or preview composition for an editable message buffer.
 
         Args:
             buffer: Editable buffer containing the complete proposed message.
         """
-
-    def __init__(self, config: PluginConfig):
-        self.config = config
-
-    def available(self, state) -> bool:
-        return self.config.enabled
-
-    def transform(self, state):
-        for tc, kwargs in self.pending(state):
+        buffer_id = str(buffer or "")
+        if not buffer_id:
+            raise ValueError("compose_message requires a buffer")
+        active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
+        if active and buffer_id != active:
             try:
-                buffer_id = str(kwargs.get("buffer") or "")
-                if not buffer_id:
-                    raise ValueError("compose_message requires a buffer")
-                active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
-                if active and buffer_id != active:
-                    try:
-                        state.buffer_manager.resolve_for_read(state, active)
-                    except (KeyError, ValueError):
-                        getattr(state, _REWRITES).pop(active, None)
-                        setattr(state, _ACTIVE_BUFFER, "")
-                        active = ""
-                    else:
-                        raise ValueError(
-                            f"composition is already active for {active}; continue that "
-                            "buffer with rewrite_response or message_user"
-                        )
+                state.buffer_manager.resolve_for_read(state, active)
+            except (KeyError, ValueError):
+                getattr(state, _REWRITES).pop(active, None)
+                setattr(state, _ACTIVE_BUFFER, "")
+                active = ""
+            else:
+                raise ValueError(
+                    f"composition is already active for {active}; continue that "
+                    "buffer with rewrite_response or message_user"
+                )
 
-                buffer = state.buffer_manager.resolve_for_read(state, buffer_id)
-                if getattr(buffer, "readonly", False):
-                    raise ValueError("compose_message requires an editable buffer")
-                rewrite = _rewrite_record(state, buffer_id)
-                if not active or not rewrite:
-                    _begin_rewrite(
-                        state,
-                        self.config,
-                        buffer_id,
-                        buffer.text,
-                        origin="voluntary",
-                    )
-                    rewrite = _rewrite_record(state, buffer_id)
-                elif rewrite.get("rewrite_hash") != self.config.rewrite_hash:
-                    origin = str(rewrite.get("origin") or "voluntary")
-                    _begin_rewrite(
-                        state,
-                        self.config,
-                        buffer_id,
-                        buffer.text,
-                        origin=origin,
-                    )
-                    rewrite = _rewrite_record(state, buffer_id)
+        buf = state.buffer_manager.resolve_for_read(state, buffer_id)
+        if getattr(buf, "readonly", False):
+            raise ValueError("compose_message requires an editable buffer")
+        rewrite = _rewrite_record(state, buffer_id)
+        if not active or not rewrite:
+            _begin_rewrite(
+                state,
+                self.config,
+                buffer_id,
+                buf.text,
+                origin="voluntary",
+            )
+            rewrite = _rewrite_record(state, buffer_id)
+        elif rewrite.get("rewrite_hash") != self.config.rewrite_hash:
+            origin = str(rewrite.get("origin") or "voluntary")
+            _begin_rewrite(
+                state,
+                self.config,
+                buffer_id,
+                buf.text,
+                origin=origin,
+            )
+            rewrite = _rewrite_record(state, buffer_id)
 
-                if not bool(rewrite.get("previewed", False)):
-                    rewrite["previewed"] = True
-                    tc.result = _attention_preview(state, buffer_id, self.config)
-                    tc.error = False
-                else:
-                    stage_index = int(rewrite.get("stage_index", 0))
-                    digest_changed = rewrite.get("buffer_digest") != _buffer_digest(
-                        buffer.text
-                    )
-                    if stage_index < len(self.config.rewrite_stages):
-                        raise ValueError(
-                            f"composition is already active at rewrite stage "
-                            f"{stage_index + 1}; edit {buffer_id} and call "
-                            f"rewrite_response(buffer=\"{buffer_id}\")"
-                        )
-                    if digest_changed:
-                        raise ValueError(
-                            f"the accepted draft changed; call "
-                            f"rewrite_response(buffer=\"{buffer_id}\") to reaccept "
-                            "the final stage"
-                        )
-                    raise ValueError(
-                        f"all rewrite stages are complete; call "
-                        f"message_user(buffer=\"{buffer_id}\") as the sole tool call"
-                    )
-            except Exception as exc:
-                tc.result = f"ERROR: {type(exc).__name__}: {exc}"
-                tc.error = True
-            self._notify(state, tc)
-        return state
+        if not bool(rewrite.get("previewed", False)):
+            rewrite["previewed"] = True
+            return _attention_preview(state, buffer_id, self.config)
+
+        stage_index = int(rewrite.get("stage_index", 0))
+        digest_changed = rewrite.get("buffer_digest") != _buffer_digest(buf.text)
+        if stage_index < len(self.config.rewrite_stages):
+            raise ValueError(
+                f"composition is already active at rewrite stage "
+                f"{stage_index + 1}; edit {buffer_id} and call "
+                f"rewrite_response(buffer=\"{buffer_id}\")"
+            )
+        if digest_changed:
+            raise ValueError(
+                f"the accepted draft changed; call "
+                f"rewrite_response(buffer=\"{buffer_id}\") to reaccept "
+                "the final stage"
+            )
+        raise ValueError(
+            f"all rewrite stages are complete; call "
+            f"message_user(buffer=\"{buffer_id}\") as the sole tool call"
+        )
 
 
 class RewriteResponse(Tool):
@@ -1104,8 +1111,16 @@ class RewriteResponse(Tool):
         },
     }
 
-    @staticmethod
-    def fn(
+    def __init__(self, config: PluginConfig):
+        super().__init__()
+        self.config = config
+
+    def available(self, state: State) -> bool:
+        return self.config.enabled
+
+    def call(
+        self,
+        state: State,
         buffer: str,
         closing_obligations: list[str] | None = None,
     ) -> str:
@@ -1119,93 +1134,117 @@ class RewriteResponse(Tool):
             buffer: Active editable message buffer being rewritten.
             closing_obligations: On the first stage only, obligation IDs this response intends to fulfill. Use an empty list if none.
         """
+        result, _is_error = self._evaluate(state, buffer=buffer, closing_obligations=closing_obligations)
+        return result
 
-    def __init__(self, config: PluginConfig):
-        self.config = config
+    def _evaluate(
+        self,
+        state: State,
+        *,
+        buffer: Any = "",
+        closing_obligations: Any = None,
+    ) -> tuple[str, bool]:
+        errors = []
+        buffer_id = str(buffer or "")
+        active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
+        if not buffer_id or buffer_id != active:
+            errors.append("buffer must be the active message draft")
+        rewrite = _rewrite_record(state, buffer_id)
+        if not rewrite:
+            errors.append("no rewrite sequence exists for this buffer")
+        elif rewrite.get("rewrite_hash") != self.config.rewrite_hash:
+            errors.append("configured rewrite stages changed after composition began")
 
-    def available(self, state) -> bool:
-        return self.config.enabled
+        try:
+            draft = state.buffer_manager.resolve_for_read(state, buffer_id).text
+        except (KeyError, ValueError) as exc:
+            draft = ""
+            errors.append(str(exc))
 
-    def transform(self, state):
-        for tc, kwargs in self.pending(state):
-            errors = []
-            buffer_id = str(kwargs.get("buffer") or "")
-            active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
-            if not buffer_id or buffer_id != active:
-                errors.append("buffer must be the active message draft")
-            rewrite = _rewrite_record(state, buffer_id)
-            if not rewrite:
-                errors.append("no rewrite sequence exists for this buffer")
-            elif rewrite.get("rewrite_hash") != self.config.rewrite_hash:
-                errors.append("configured rewrite stages changed after composition began")
-
-            try:
-                draft = state.buffer_manager.resolve_for_read(state, buffer_id).text
-            except (KeyError, ValueError) as exc:
-                draft = ""
-                errors.append(str(exc))
-
-            stage_index = int(rewrite.get("stage_index", 0)) if rewrite else 0
-            digest = _buffer_digest(draft)
-            if rewrite:
-                if stage_index >= len(self.config.rewrite_stages):
-                    if digest == rewrite.get("buffer_digest"):
-                        errors.append("all rewrite stages are already complete and the draft is unchanged")
-                    else:
-                        stage_index = len(self.config.rewrite_stages) - 1
-                elif digest == rewrite.get("buffer_digest"):
-                    errors.append("the buffer hash is unchanged; revise the draft before advancing")
-
-            supplied = kwargs.get("closing_obligations")
-            if stage_index == 0:
-                if supplied is None:
-                    errors.append("closing_obligations is required on the first rewrite stage")
-                    selected = []
-                elif not isinstance(supplied, list) or any(not isinstance(item, str) for item in supplied):
-                    errors.append("closing_obligations must be a list of obligation IDs")
-                    selected = []
+        stage_index = int(rewrite.get("stage_index", 0)) if rewrite else 0
+        digest = _buffer_digest(draft)
+        if rewrite:
+            if stage_index >= len(self.config.rewrite_stages):
+                if digest == rewrite.get("buffer_digest"):
+                    errors.append("all rewrite stages are already complete and the draft is unchanged")
                 else:
-                    selected = [item.strip() for item in supplied if item.strip()]
-                    if len(selected) != len(set(selected)):
-                        errors.append("closing_obligations contains duplicate IDs")
-                    known = set(getattr(state, _OBLIGATIONS).ids())
-                    unknown = [item for item in selected if item not in known]
-                    if unknown:
-                        errors.append("unknown obligation IDs: " + ", ".join(unknown))
-            else:
-                selected = list(rewrite.get("closing_obligations", [])) if rewrite else []
-                if supplied not in (None, []):
-                    errors.append(
-                        "closing_obligations is accepted only on the first rewrite stage; "
-                        "later stages preserve the original selection automatically"
-                    )
+                    stage_index = len(self.config.rewrite_stages) - 1
+            elif digest == rewrite.get("buffer_digest"):
+                errors.append("the buffer hash is unchanged; revise the draft before advancing")
 
-            if errors:
-                tc.result = (
-                    "ERROR: " + "; ".join(errors) + ". "
-                    + self._next_action(state, buffer_id)
+        supplied = closing_obligations
+        if stage_index == 0:
+            if supplied is None:
+                errors.append("closing_obligations is required on the first rewrite stage")
+                selected = []
+            elif not isinstance(supplied, list) or any(not isinstance(item, str) for item in supplied):
+                errors.append("closing_obligations must be a list of obligation IDs")
+                selected = []
+            else:
+                selected = [item.strip() for item in supplied if item.strip()]
+                if len(selected) != len(set(selected)):
+                    errors.append("closing_obligations contains duplicate IDs")
+                known = set(getattr(state, _OBLIGATIONS).ids())
+                unknown = [item for item in selected if item not in known]
+                if unknown:
+                    errors.append("unknown obligation IDs: " + ", ".join(unknown))
+        else:
+            selected = list(rewrite.get("closing_obligations", [])) if rewrite else []
+            if supplied not in (None, []):
+                errors.append(
+                    "closing_obligations is accepted only on the first rewrite stage; "
+                    "later stages preserve the original selection automatically"
                 )
-                tc.error = True
-            else:
-                rewrite["closing_obligations"] = selected
-                rewrite["buffer_digest"] = digest
-                rewrite["stage_index"] = stage_index + 1
-                rewrite["accepted_at"] = time.time()
-                if rewrite["stage_index"] >= len(self.config.rewrite_stages):
-                    tc.result = (
-                        f"Rewrite stage {stage_index + 1} accepted. All configured stages are complete. "
-                        f"Submission is unlocked; call message_user(buffer=\"{buffer_id}\") as the sole tool call. "
-                        "Any further buffer edit will lock submission again."
-                    )
-                else:
-                    tc.result = (
-                        f"Rewrite stage {stage_index + 1} accepted.\n\n"
-                        f"{_rewrite_prompt(self.config, rewrite['stage_index'])}\n\n"
-                        f"Edit {buffer_id}, then call rewrite_response(buffer=\"{buffer_id}\")."
-                    )
-            self._notify(state, tc)
-        return state
 
+        if errors:
+            return (
+                "ERROR: " + "; ".join(errors) + ". " + self._next_action(state, buffer_id),
+                True,
+            )
+
+        rewrite["closing_obligations"] = selected
+        rewrite["buffer_digest"] = digest
+        rewrite["stage_index"] = stage_index + 1
+        rewrite["accepted_at"] = time.time()
+        if rewrite["stage_index"] >= len(self.config.rewrite_stages):
+            return (
+                f"Rewrite stage {stage_index + 1} accepted. All configured stages are complete. "
+                f"Submission is unlocked; call message_user(buffer=\"{buffer_id}\") as the sole tool call. "
+                "Any further buffer edit will lock submission again.",
+                False,
+            )
+        return (
+            f"Rewrite stage {stage_index + 1} accepted.\n\n"
+            f"{_rewrite_prompt(self.config, rewrite['stage_index'])}\n\n"
+            f"Edit {buffer_id}, then call rewrite_response(buffer=\"{buffer_id}\").",
+            False,
+        )
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if not isinstance(event, RunToolCall):
+            return
+        tc = event.tool_call
+        if tc.name != self.name:
+            return
+        event.stop()
+        if tc.started_at is None:
+            tc.started_at = event.ts
+        if not self.available(state):
+            tc.result = f"ERROR: {self.name} is not currently available."
+            tc.error = True
+            tc.finished_at = event.ts
+            emit(ToolCallFinished(tc))
+            return
+        result, is_error = self._evaluate(
+            state,
+            buffer=tc.parsed_args.get("buffer", ""),
+            closing_obligations=tc.parsed_args.get("closing_obligations"),
+        )
+        tc.result = result
+        tc.error = is_error
+        tc.finished_at = event.ts
+        tc._owner = None
+        emit(ToolCallFinished(tc))
 
     def _next_action(self, state, buffer_id: str) -> str:
         active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
@@ -1233,13 +1272,20 @@ class RewriteResponse(Tool):
 class MessageUser(Tool):
     """Publish an accepted message buffer through a visible terminal tool call."""
 
+    name = MESSAGE_USER_TOOL
     group = "Communication"
     reads = {"pending_tool_calls", "buffer_manager", _ACTIVE_BUFFER, _OBLIGATIONS, _REWRITES}
     writes = {_PENDING_PUBLICATIONS}
     init = {_PENDING_PUBLICATIONS: dict}
 
-    @staticmethod
-    def fn(buffer: str) -> str:
+    def __init__(self, config: PluginConfig):
+        super().__init__()
+        self.config = config
+
+    def available(self, state: State) -> bool:
+        return self.config.enabled
+
+    def call(self, state: State, buffer: str) -> str:
         """Publish a fully rewritten message buffer to the human.
 
         A successful call remains visible in the transcript with its tool result.
@@ -1248,58 +1294,81 @@ class MessageUser(Tool):
         Args:
             buffer: Active buffer whose complete contents should be published.
         """
+        result, _is_error = self._evaluate(state, tc_id="", buffer=buffer)
+        return result
 
-    def __init__(self, config: PluginConfig):
-        self.config = config
-
-    def available(self, state) -> bool:
-        return self.config.enabled
-
-    def transform(self, state):
+    def _evaluate(self, state: State, *, tc_id: str, buffer: Any = "") -> tuple[str, bool]:
         pending_calls = list(getattr(state, "pending_tool_calls", ()) or ())
-        for tc, kwargs in self.pending(state):
-            buffer_id = str(kwargs.get("buffer") or "")
-            errors = []
-            if len(pending_calls) != 1 or pending_calls[0].id != tc.id:
-                errors.append(
-                    "message_user must be the sole tool call in its assistant response"
-                )
-            if not buffer_id:
-                errors.append("buffer is required")
-                current = False
-                reason = "No message buffer was supplied."
-            else:
-                current, reason = _delivery_status(state, self.config, buffer_id)
-                if not current:
-                    errors.append(reason)
+        buffer_id = str(buffer or "")
+        errors = []
+        if tc_id and (len(pending_calls) != 1 or pending_calls[0].id != tc_id):
+            errors.append(
+                "message_user must be the sole tool call in its assistant response"
+            )
+        if not buffer_id:
+            errors.append("buffer is required")
+            current = False
+            reason = "No message buffer was supplied."
+        else:
+            current, reason = _delivery_status(state, self.config, buffer_id)
+            if not current:
+                errors.append(reason)
 
-            content = ""
-            if current:
-                content = state.buffer_manager.resolve_for_read(state, buffer_id).text
-                if not content.strip():
-                    errors.append("the accepted message buffer is empty")
+        content = ""
+        if current:
+            content = state.buffer_manager.resolve_for_read(state, buffer_id).text
+            if not content.strip():
+                errors.append("the accepted message buffer is empty")
 
-            if errors:
-                tc.result = "ERROR: " + "; ".join(errors) + ". " + self._next_action(
-                    state, buffer_id
-                )
-                tc.error = True
-            else:
-                rewrite = _rewrite_record(state, buffer_id) or {}
-                closing_obligations = list(rewrite.get("closing_obligations", []))
-                getattr(state, _PENDING_PUBLICATIONS)[tc.id] = {
-                    "buffer_id": buffer_id,
-                    "content": content,
-                    "closing_obligations": closing_obligations,
-                    "accepted_at": time.time(),
-                }
-                tc.result = (
-                    f"Message published successfully from {buffer_id}. "
-                    "The accepted buffer content has been added as the next assistant message."
-                )
-                tc.error = False
-            self._notify(state, tc)
-        return state
+        if errors:
+            return (
+                "ERROR: " + "; ".join(errors) + ". " + self._next_action(state, buffer_id),
+                True,
+            )
+
+        rewrite = _rewrite_record(state, buffer_id) or {}
+        closing_obligations = list(rewrite.get("closing_obligations", []))
+        publications = getattr(state, _PENDING_PUBLICATIONS, None)
+        if not isinstance(publications, dict):
+            publications = {}
+            setattr(state, _PENDING_PUBLICATIONS, publications)
+        publications[tc_id] = {
+            "buffer_id": buffer_id,
+            "content": content,
+            "closing_obligations": closing_obligations,
+            "accepted_at": time.time(),
+        }
+        return (
+            f"Message published successfully from {buffer_id}. "
+            "The accepted buffer content has been added as the next assistant message.",
+            False,
+        )
+
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        if not isinstance(event, RunToolCall):
+            return
+        tc = event.tool_call
+        if tc.name != self.name:
+            return
+        event.stop()
+        if tc.started_at is None:
+            tc.started_at = event.ts
+        if not self.available(state):
+            tc.result = f"ERROR: {self.name} is not currently available."
+            tc.error = True
+            tc.finished_at = event.ts
+            emit(ToolCallFinished(tc))
+            return
+        result, is_error = self._evaluate(
+            state,
+            tc_id=tc.id,
+            buffer=tc.parsed_args.get("buffer", ""),
+        )
+        tc.result = result
+        tc.error = is_error
+        tc.finished_at = event.ts
+        tc._owner = None
+        emit(ToolCallFinished(tc))
 
     def _next_action(self, state, buffer_id: str) -> str:
         active = str(getattr(state, _ACTIVE_BUFFER, "") or "")
@@ -1321,6 +1390,7 @@ class MessageUser(Tool):
 class AppendPublishedMessage:
     """Append accepted buffer content after the visible message_user tool result."""
 
+    handles = (ToolBatchCompleted,)
     reads = {
         "entries",
         "last_tool_calls",
@@ -1336,13 +1406,17 @@ class AppendPublishedMessage:
         _OBLIGATIONS,
         _REWRITES,
         _PENDING_PUBLICATIONS,
+        "dirty",
     }
 
     def __init__(self, config: PluginConfig):
         self.config = config
 
-    def __call__(self, state):
-        publications = getattr(state, _PENDING_PUBLICATIONS)
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        assert isinstance(event, ToolBatchCompleted)
+        publications = getattr(state, _PENDING_PUBLICATIONS, None)
+        if not isinstance(publications, dict) or not publications:
+            return
         appended = False
         for tc in list(getattr(state, "last_tool_calls", ()) or ()):
             payload = publications.pop(tc.id, None)
@@ -1369,7 +1443,7 @@ class AppendPublishedMessage:
                 messages=[{"role": "assistant", "content": content}],
                 index=len(state.entries),
                 step=getattr(state, "step", 0),
-                tokens=estimate_tokens(content),
+                tokens=_estimate_tokens(content),
                 metadata=metadata,
             ))
             getattr(state, _OBLIGATIONS).remove_many(closing_obligations)
@@ -1379,12 +1453,13 @@ class AppendPublishedMessage:
             appended = True
         if appended:
             state.last_tool_calls = []
-        return state
+            state.dirty = True
 
 
 class CommunicationProtocolSystemPrompt(RenderTransformRegistrar):
     """Register configurable communication guidance on the model-channel system prompt."""
 
+    handles = (RenderRequested,)
     reads = {"entries"}
     writes = {
         _TURN_STARTED_AT,
@@ -1401,16 +1476,19 @@ class CommunicationProtocolSystemPrompt(RenderTransformRegistrar):
     def __init__(self, config: PluginConfig):
         self.guidance = config.system_prompt_guidance
 
-    def __call__(self, state):
+    def handle(self, event: Event, state: State, emit: EmitFn) -> None:
+        assert isinstance(event, RenderRequested)
+        if event.channels is not None and MODEL_RENDER_CHANNEL not in event.channels:
+            return
         _record_new_user_turn(state)
         if not state.entries:
-            return state
+            return
         entry = state.entries[0]
         if self.transform_name in entry.render_transform_names(
             MODEL_RENDER_CHANNEL,
             pending=True,
         ):
-            return state
+            return
         block = "# Message Composition\n" + self.guidance
 
         def transform(messages, _state, _block=block):
@@ -1428,7 +1506,6 @@ class CommunicationProtocolSystemPrompt(RenderTransformRegistrar):
             transform,
             name=self.transform_name,
         )
-        return state
 
     @staticmethod
     def _append_content(content: Any, block: str) -> Any:
@@ -1519,13 +1596,14 @@ def register_features(builder, *, session, config):
             CommunicationProtocolSystemPrompt(plugin_config),
         ],
         order=[
-            AppendInput,
+            IoFence,
             MessageCompositionGuard,
-            TurnCounter,
-            ToolDispatchStart,
+            AppendInput,
+            ToolRunner,
             Tool,
             ConsolidateToolResults,
             AppendPublishedMessage,
+            TurnCounter,
             CompressToolResults,
             SystemPromptSkillList,
             CommunicationProtocolSystemPrompt,

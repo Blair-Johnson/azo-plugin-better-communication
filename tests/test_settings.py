@@ -6,8 +6,9 @@ from types import SimpleNamespace
 
 import pytest
 
-from agent_utils import PipelineBuilder, State
-from agent_zoo.runtime.settings import Setting, SettingError, SettingsContext, SettingsRegistry
+from agent_utils.core.pipeline import PipelineBuilder
+from agent_utils.core.state import State
+from agent_zoo.features.settings import Setting, SettingError, SettingsContext, SettingsRegistry
 import better_communication as plugin
 
 
@@ -37,15 +38,15 @@ def settings_file(tmp_path, monkeypatch):
 
 def registry(config=None):
     session = SimpleNamespace(state=State())
-    builder = PipelineBuilder(session)
+    builder = PipelineBuilder()
     plugin.register_features(builder, session=session, config=config or {})
     # Build the normal registration, including its settings while disabled.
-    components = builder.build()
-    settings = [component for component in components if isinstance(component, Setting)]
+    pipeline = builder.build()
+    settings = [component for component in pipeline.components if isinstance(component, Setting)]
     result = SettingsRegistry(settings)
     assert result.error is None
     assert len(settings) == 1
-    return result, SettingsContext(session), builder
+    return result, SettingsContext(state=session.state, emit=lambda _ev: None), builder
 
 
 def edit(registry, ctx, value):
@@ -58,7 +59,7 @@ def test_disabled_registration_round_trip(settings_file):
     original = load(settings_file)
     reg, ctx, builder = registry()
     row, = reg.catalog(ctx)
-    assert row["value"] == False
+    assert row["value"] is False
     assert row["kind"] == "bool"
     assert row["apply"] == "reload" and row["writable"]
     assert row["error"] is None
@@ -72,10 +73,10 @@ def test_disabled_registration_round_trip(settings_file):
     # The existing builder is not live-mutated by a reload-scoped setting.
     assert not builder.has("guarded_message_composition")
     session = SimpleNamespace(state=State())
-    fresh = PipelineBuilder(session)
+    fresh = PipelineBuilder()
     plugin.register_features(fresh, session=session, config={})
     assert fresh.has("guarded_message_composition")
-    assert reg.catalog(ctx)[0]["value"] == True
+    assert reg.catalog(ctx)[0]["value"] is True
     assert list(settings_file.parent.iterdir()) == [settings_file]
 
 
@@ -131,10 +132,10 @@ def test_missing_user_config_never_writes_bundled_source(tmp_path, monkeypatch):
     target = plugin._config_path(writable=True)
     assert target != bundled and not target.exists()
     session = SimpleNamespace(state=State())
-    builder = PipelineBuilder(session)
+    builder = PipelineBuilder()
     plugin._register_settings(builder)
-    reg = SettingsRegistry([c for c in builder.build() if isinstance(c, Setting)])
-    ctx = SettingsContext(session)
+    reg = SettingsRegistry([c for c in builder.build().components if isinstance(c, Setting)])
+    ctx = SettingsContext(state=session.state, emit=lambda _ev: None)
     assert reg.catalog(ctx)[0]["value"] is bool(load(bundled).get("enabled", True))
     assert not edit(reg, ctx, False)["ok"]
     assert bundled.read_bytes() == before
